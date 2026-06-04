@@ -1,0 +1,39 @@
+services:
+  rabbitmq:
+    image: rabbitmq:management
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    mem_limit: 2g
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      # Allow RabbitMQ to use up to 70% of its container memory before blocking publishers
+      # RABBITMQ_VM_MEMORY_HIGH_WATERMARK: "0.7"
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+
+  mysql:
+    image: mysql:8
+    command: >
+      --innodb-flush-log-at-trx-commit=2
+      --innodb-buffer-pool-size=2G
+      --innodb-redo-log-capacity=2G
+      --max-allowed-packet=256M
+      --innodb-log-buffer-size=256M
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: new_db
+      MYSQL_USER: itc
+      MYSQL_PASSWORD: itc
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:

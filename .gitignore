@@ -1,0 +1,29 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+
+
+
+
+# Sensitive config
+application-local.properties
+
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# Env
+.env
+
+# Ignore Kotlin plugin data
+.kotlin
+
+
+*.csv
