@@ -13,7 +13,7 @@ public class TransactionRepository {
     public void save(Transaction t) throws SQLException {
         String sql = """
                 INSERT INTO transactions (
-                    id, payment_type_id, source_id, thirdparty_id, source_date_created,
+                    generated_id, payment_type_id, source_id, thirdparty_id, source_date_created,
                     source_account_no, source_trans_id, channel_id, terminal_id, merchant_id,
                     product_id, sub_merchant_id, accountref, accountname, paymentmsisdn,
                     narration, currency, amount, fees, year, processor, country, transtype, month
@@ -31,7 +31,7 @@ public class TransactionRepository {
     public int saveBatch(List<Transaction> transactions) throws SQLException {
         String sql = """
                 INSERT INTO transactions (
-                    id, payment_type_id, source_id, thirdparty_id, source_date_created,
+                    generated_id, payment_type_id, source_id, thirdparty_id, source_date_created,
                     source_account_no, source_trans_id, channel_id, terminal_id, merchant_id,
                     product_id, sub_merchant_id, accountref, accountname, paymentmsisdn,
                     narration, currency, amount, fees, year, processor, country, transtype, month
@@ -73,7 +73,7 @@ public class TransactionRepository {
     }
 
     private void setParams(PreparedStatement stmt, Transaction t) throws SQLException {
-        stmt.setString(1, t.getId());
+        stmt.setString(1, t.getGeneratedId());
         stmt.setString(2, t.getPaymentTypeId());
         stmt.setString(3, t.getSourceId());
         stmt.setString(4, t.getThirdpartyId());
@@ -99,23 +99,4 @@ public class TransactionRepository {
         stmt.setString(24, t.getMonth());
     }
 
-    // Single row INSERT - used only in fallback
-    public int saveIgnore(Transaction t) throws SQLException {
-        String sql = """
-                INSERT INTO transactions (
-                    id, payment_type_id, source_id, thirdparty_id, source_date_created,
-                    source_account_no, source_trans_id, channel_id, terminal_id, merchant_id,
-                    product_id, sub_merchant_id, accountref, accountname, paymentmsisdn,
-                    narration, currency, amount, fees, year, processor, country, transtype, month
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """;
-
-        try (Connection conn = DatabaseConfig.getConnection();
-            PreparedStatement stmt = conn.prepareStatement(sql)) {
-
-            setParams(stmt, t);
-            int rows = stmt.executeUpdate();
-            return rows;
-        }
-    }
 }

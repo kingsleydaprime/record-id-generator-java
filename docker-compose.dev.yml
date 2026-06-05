@@ -25,6 +25,7 @@ services:
       --innodb-redo-log-capacity=2G
       --max-allowed-packet=256M
       --innodb-log-buffer-size=256M
+      --local-infile=1
     ports:
       - "3306:3306"
     environment:

@@ -6,8 +6,8 @@ import java.time.LocalDateTime;
 
 @Data
 public class Transaction {
-    private String id;
-    private String sourceHash;
+    private Long id;
+    private String generatedId;
     private String paymentTypeId;
     private String sourceId;
     private String thirdpartyId;

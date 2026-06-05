@@ -10,15 +10,12 @@ import com.rabbitmq.client.*;
 
 import java.io.IOException;
 import java.math.BigDecimal;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -32,12 +29,17 @@ public class FileConsumer {
     private final LogRepository logRepository = new LogRepository();
     private final IdGeneratorService idGenerator = new IdGeneratorService();
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-    private static final int BATCH_SIZE = 10_000;
+    private static final int BATCH_SIZE = 50_000;
     private static final Logger log = LoggerFactory.getLogger(FileConsumer.class);
     private static final int FLUSH_INTERVAL_SECONDS = 10;
     private final ExecutorService flushExecutor = Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final Object batchLock = new Object();
+
+    // Shared across all consumers in file-load mode so cross-consumer collisions are
+    // caught in Java before reaching the DB (which has no unique index during the load).
+    // null in drain mode — the index is present and handles the rare collision via retry.
+    private final Set<Long> usedIds;
 
     // Observability counters — updated only from the RabbitMQ callback thread
     private long totalProcessed = 0;
@@ -45,24 +47,42 @@ public class FileConsumer {
     private long totalErrors = 0;
     private final long startTime = System.currentTimeMillis();
 
+    // Drain mode: unique index is active, DB catches the rare collision via retry logic.
+    public FileConsumer() {
+        this.usedIds = null;
+    }
+
+    // File-load mode: unique index is dropped for speed; shared set prevents cross-consumer duplicates.
+    public FileConsumer(Set<Long> usedIds) {
+        this.usedIds = usedIds;
+    }
+
+    private String generateUniqueId() {
+        if (usedIds == null) return idGenerator.generate();
+        String id = idGenerator.generate();
+        while (!usedIds.add(Long.parseLong(id))) {
+            id = idGenerator.generate();
+        }
+        return id;
+    }
+
     public void consume() throws IOException, java.util.concurrent.TimeoutException {
-        log.debug("consume() start on {}", Thread.currentThread().getName());
+        // log.debug("consume() start on {}", Thread.currentThread().getName());
         Channel channel = RabbitMQConfig.createChannel();
-        log.debug("channel created on {}", Thread.currentThread().getName());
+        // log.debug("channel created on {}", Thread.currentThread().getName());
         channel.basicQos(BATCH_SIZE * 2);
-        log.debug("QoS set on {}", Thread.currentThread().getName());
+        // log.debug("QoS set on {}", Thread.currentThread().getName());
 
         List<Transaction> batch = new ArrayList<>();
         List<String> batchLines = new ArrayList<>();
         List<Long> deliveryTags = new ArrayList<>();
 
         DeliverCallback callback = (consumerTag, delivery) -> {
-            log.debug("message received on {}", Thread.currentThread().getName());
+            // log.debug("message received on {}", Thread.currentThread().getName());
             String line = new String(delivery.getBody());
             try {
                 Transaction transaction = parseLine(line);
-                // transaction.setSourceHash(computeHash(transaction));
-                transaction.setId(idGenerator.generate());
+                transaction.setGeneratedId(generateUniqueId());
 
                 List<Transaction> batchSnapshot = null;
                 List<String> linesSnapshot = null;
@@ -114,9 +134,9 @@ public class FileConsumer {
             submitFlush(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
         }, FLUSH_INTERVAL_SECONDS, FLUSH_INTERVAL_SECONDS, TimeUnit.SECONDS);
 
-        log.debug("calling basicConsume on {}", Thread.currentThread().getName());
+        // log.debug("calling basicConsume on {}", Thread.currentThread().getName());
         channel.basicConsume(RabbitMQConfig.getQueueName(), false, callback, consumerTag -> {});
-        log.debug("basicConsume returned on {}", Thread.currentThread().getName());
+        // log.debug("basicConsume returned on {}", Thread.currentThread().getName());
     }
 
     private void submitFlush(Channel channel, List<Transaction> batchSnapshot,
@@ -133,35 +153,6 @@ public class FileConsumer {
         });
     }
 
-    // private void flushBatch(Channel channel, List<Transaction> batch, List<String> batchLines, List<Long> deliveryTags) throws IOException {
-    //     long batchStart = System.currentTimeMillis();
-    //     try {
-    //         int skipped = transactionRepository.saveBatch(batch);
-    //         long batchMs = System.currentTimeMillis() - batchStart;
-    //         totalProcessed += batch.size() - skipped;
-    //         totalDuplicates += skipped;
-    //         logStats(batch.size(), skipped, batchMs);
-    //         channel.basicAck(deliveryTags.get(deliveryTags.size() - 1), true);
-    //     } catch (Exception e) {
-    //         log.warn("Batch insert failed, falling back to individual saves. Cause: {}", e.getMessage());
-    //         for (int i = 0; i < batch.size(); i++) {
-    //             try {
-    //                 saveWithRetry(batch.get(i));
-    //                 totalProcessed++;
-    //                 channel.basicAck(deliveryTags.get(i), false);
-    //             } catch (Exception ex) {
-    //                 totalErrors++;
-    //                 logError(ex, batchLines.get(i));
-    //                 channel.basicNack(deliveryTags.get(i), false, false);
-    //             }
-    //         }
-    //     } finally {
-    //         batch.clear();
-    //         batchLines.clear();
-    //         deliveryTags.clear();
-    //     }
-    // }
-
     private void flushBatch(Channel channel, List<Transaction> batch, List<String> batchLines, List<Long> deliveryTags) throws IOException, SQLException {
     long batchStart = System.currentTimeMillis();
     int skipped = 0;
@@ -177,11 +168,11 @@ public class FileConsumer {
                 if (dupId == null) throw e;
                 final int currentAttempt = attempt;
                 batch.stream()
-                     .filter(t -> dupId.equals(t.getId()))
+                     .filter(t -> dupId.equals(t.getGeneratedId()))
                      .findFirst()
                      .ifPresent(t -> {
-                         log.warn("PK collision on id={}, retry {}/{}", dupId, currentAttempt + 1, maxPkRetries);
-                         t.setId(idGenerator.generate());
+                         log.warn("generated_id collision on id={}, retry {}/{}", dupId, currentAttempt + 1, maxPkRetries);
+                         t.setGeneratedId(generateUniqueId());
                      });
             } else if (isRetriable(e)) {
                 log.warn("Retriable DB error ({}), falling back to individual inserts.", e.getErrorCode());
@@ -209,7 +200,7 @@ public class FileConsumer {
 private String parseDuplicateId(String message) {
     if (message == null) return null;
     java.util.regex.Matcher m = java.util.regex.Pattern
-            .compile("Duplicate entry '(.+?)' for key 'PRIMARY'")
+            .compile("Duplicate entry '(.+?)' for key 'transactions\\.ux_generated_id'")
             .matcher(message);
     return m.find() ? m.group(1) : null;
 }
@@ -248,55 +239,22 @@ private void saveWithRetry(Transaction t) throws SQLException {
             return;
         } catch (SQLException e) {
             if (e.getErrorCode() == 1062 && attempt < maxRetries) {
-                log.warn("PK collision on id={}, retry {}/{}", t.getId(), attempt + 1, maxRetries);
-                t.setId(idGenerator.generate());
+                log.warn("generated_id collision on id={}, retry {}/{}", t.getGeneratedId(), attempt + 1, maxRetries);
+                t.setGeneratedId(generateUniqueId());
             } else {
                 throw e;
             }
         }
     }
 }
-    // private void saveWithRetry(Transaction transaction) throws Exception {
-    //     int attempts = 0;
-    //     while (attempts < 3) {
-    //         try {
-    //             transaction.setId(idGenerator.generate());
-    //             transactionRepository.save(transaction);
-    //             return;
-    //         } catch (SQLIntegrityConstraintViolationException e) {
-    //             if (isDuplicateHash(e)) {
-    //                 totalDuplicates++;
-    //                 log.debug("Skipping duplicate: sourceTransId={}", transaction.getSourceTransId());
-    //                 return;
-    //             }
-    //             attempts++;
-    //             if (attempts == 3) throw e;
-    //         }
-    //     }
-    // }
-
-    // private boolean isDuplicateHash(SQLIntegrityConstraintViolationException e) {
-    //     return e.getMessage() != null && e.getMessage().contains("ux_source_hash");
-    // }
-
-    private String computeHash(Transaction t) {
-        try {
-            String input = t.getSourceTransId() + "|" + t.getSourceId() + "|" + t.getSourceDateCreated();
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(hash);
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("SHA-256 not available", e);
-        }
-    }
-
     private void logStats(int batchSize, int skipped, long batchMs) {
         long elapsed = System.currentTimeMillis() - startTime;
-        double rate = totalProcessed / (elapsed / 1000.0);
-        log.info("Batch {}: inserted={} skipped={} in {}ms | total={} rate={}/sec dupes={} errors={}",
+        double batchRate = batchMs > 0 ? (batchSize - skipped) / (batchMs / 1000.0) : 0;
+        double lifetimeRate = totalProcessed / (elapsed / 1000.0);
+        log.info("Batch {}: inserted={} skipped={} in {}ms | batch={}/s lifetime={}/s total={} dupes={} errors={}",
                 batchSize, batchSize - skipped, skipped, batchMs,
-                totalProcessed, String.format("%.0f", rate),
-                totalDuplicates, totalErrors);
+                String.format("%.0f", batchRate), String.format("%.0f", lifetimeRate),
+                totalProcessed, totalDuplicates, totalErrors);
     }
 
     private String[] splitCsv(String line) {
