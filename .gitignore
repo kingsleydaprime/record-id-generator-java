@@ -27,3 +27,5 @@ build/
 
 
 *.csv
+
+*.log

@@ -21,6 +21,8 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,7 +34,10 @@ public class FileConsumer {
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final int BATCH_SIZE = 10_000;
     private static final Logger log = LoggerFactory.getLogger(FileConsumer.class);
+    private static final int FLUSH_INTERVAL_SECONDS = 10;
     private final ExecutorService flushExecutor = Executors.newSingleThreadExecutor();
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final Object batchLock = new Object();
 
     // Observability counters — updated only from the RabbitMQ callback thread
     private long totalProcessed = 0;
@@ -41,51 +46,91 @@ public class FileConsumer {
     private final long startTime = System.currentTimeMillis();
 
     public void consume() throws IOException, java.util.concurrent.TimeoutException {
+        log.debug("consume() start on {}", Thread.currentThread().getName());
         Channel channel = RabbitMQConfig.createChannel();
-        RabbitMQConfig.declareQueues(channel);
-        channel.basicQos(BATCH_SIZE); // Prefetch count for fair dispatch
+        log.debug("channel created on {}", Thread.currentThread().getName());
+        channel.basicQos(BATCH_SIZE * 2);
+        log.debug("QoS set on {}", Thread.currentThread().getName());
 
         List<Transaction> batch = new ArrayList<>();
         List<String> batchLines = new ArrayList<>();
         List<Long> deliveryTags = new ArrayList<>();
 
         DeliverCallback callback = (consumerTag, delivery) -> {
+            log.debug("message received on {}", Thread.currentThread().getName());
             String line = new String(delivery.getBody());
             try {
                 Transaction transaction = parseLine(line);
-                transaction.setSourceHash(computeHash(transaction));
+                // transaction.setSourceHash(computeHash(transaction));
                 transaction.setId(idGenerator.generate());
-                batch.add(transaction);
-                batchLines.add(line);
-                deliveryTags.add(delivery.getEnvelope().getDeliveryTag());
 
-                if (batch.size() >= BATCH_SIZE) {
-                    List<Transaction> batchSnapshot = new ArrayList<>(batch);
-                    List<String> linesSnapshot = new ArrayList<>(batchLines);
-                    List<Long> tagsSnapshot = new ArrayList<>(deliveryTags);
-                    batch.clear();
-                    batchLines.clear();
-                    deliveryTags.clear();
-                    flushExecutor.submit(() -> {
-                        try {
-                            flushBatch(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
-                        } catch (Exception e) {
-                            log.error("Flush failed, nacking {} messages to DLQ: {}", tagsSnapshot.size(), e.getMessage(), e);
-                            for (Long tag : tagsSnapshot) {
-                                try { channel.basicNack(tag, false, false); } catch (IOException ignored) {}
-                            }
-                        }
-                    });
+                List<Transaction> batchSnapshot = null;
+                List<String> linesSnapshot = null;
+                List<Long> tagsSnapshot = null;
+
+                synchronized (batchLock) {
+                    batch.add(transaction);
+                    batchLines.add(line);
+                    deliveryTags.add(delivery.getEnvelope().getDeliveryTag());
+
+                    if (batch.size() >= BATCH_SIZE) {
+                        batchSnapshot = new ArrayList<>(batch);
+                        linesSnapshot = new ArrayList<>(batchLines);
+                        tagsSnapshot = new ArrayList<>(deliveryTags);
+                        batch.clear();
+                        batchLines.clear();
+                        deliveryTags.clear();
+                    }
+                }
+
+                if (batchSnapshot != null) {
+                    submitFlush(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
                 }
             } catch (Exception e) {
                 totalErrors++;
                 logError(e, line);
-                // Nack to DLQ — message is preserved for replay, not silently discarded
                 channel.basicNack(delivery.getEnvelope().getDeliveryTag(), false, false);
             }
         };
 
+        // Flush whatever is buffered every 10 seconds — handles the tail end of the queue
+        // where remaining messages never accumulate to a full batch.
+        scheduler.scheduleAtFixedRate(() -> {
+            List<Transaction> batchSnapshot;
+            List<String> linesSnapshot;
+            List<Long> tagsSnapshot;
+
+            synchronized (batchLock) {
+                if (batch.isEmpty()) return;
+                batchSnapshot = new ArrayList<>(batch);
+                linesSnapshot = new ArrayList<>(batchLines);
+                tagsSnapshot = new ArrayList<>(deliveryTags);
+                batch.clear();
+                batchLines.clear();
+                deliveryTags.clear();
+            }
+
+            log.info("Timed flush: flushing {} buffered messages", batchSnapshot.size());
+            submitFlush(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
+        }, FLUSH_INTERVAL_SECONDS, FLUSH_INTERVAL_SECONDS, TimeUnit.SECONDS);
+
+        log.debug("calling basicConsume on {}", Thread.currentThread().getName());
         channel.basicConsume(RabbitMQConfig.getQueueName(), false, callback, consumerTag -> {});
+        log.debug("basicConsume returned on {}", Thread.currentThread().getName());
+    }
+
+    private void submitFlush(Channel channel, List<Transaction> batchSnapshot,
+                              List<String> linesSnapshot, List<Long> tagsSnapshot) {
+        flushExecutor.submit(() -> {
+            try {
+                flushBatch(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
+            } catch (Exception e) {
+                log.error("Flush failed, nacking {} messages to DLQ: {}", tagsSnapshot.size(), e.getMessage(), e);
+                for (Long tag : tagsSnapshot) {
+                    try { channel.basicNack(tag, false, false); } catch (IOException ignored) {}
+                }
+            }
+        });
     }
 
     // private void flushBatch(Channel channel, List<Transaction> batch, List<String> batchLines, List<Long> deliveryTags) throws IOException {
@@ -120,17 +165,32 @@ public class FileConsumer {
     private void flushBatch(Channel channel, List<Transaction> batch, List<String> batchLines, List<Long> deliveryTags) throws IOException, SQLException {
     long batchStart = System.currentTimeMillis();
     int skipped = 0;
+    int maxPkRetries = 3;
 
-    try {
-        skipped = transactionRepository.saveBatch(batch);
-    }
-    catch (SQLException e) {
-        if (isRetriable(e)) {
-            log.warn("Retriable DB error ({}), falling back to individual INSERT IGNORE.", e.getErrorCode());
-            skipped = fallbackToIndividualIgnore(batch, batchLines, deliveryTags, channel);
-        } else {
-            log.error("Unexpected error during batch insert", e);
-            throw e;
+    for (int attempt = 0; attempt <= maxPkRetries; attempt++) {
+        try {
+            skipped = transactionRepository.saveBatch(batch);
+            break;
+        } catch (SQLException e) {
+            if (e.getErrorCode() == 1062 && attempt < maxPkRetries) {
+                String dupId = parseDuplicateId(e.getMessage());
+                if (dupId == null) throw e;
+                final int currentAttempt = attempt;
+                batch.stream()
+                     .filter(t -> dupId.equals(t.getId()))
+                     .findFirst()
+                     .ifPresent(t -> {
+                         log.warn("PK collision on id={}, retry {}/{}", dupId, currentAttempt + 1, maxPkRetries);
+                         t.setId(idGenerator.generate());
+                     });
+            } else if (isRetriable(e)) {
+                log.warn("Retriable DB error ({}), falling back to individual inserts.", e.getErrorCode());
+                skipped = fallbackToIndividual(batch, batchLines, deliveryTags, channel);
+                break;
+            } else {
+                log.error("Unexpected error during batch insert", e);
+                throw e;
+            }
         }
     }
 
@@ -146,6 +206,14 @@ public class FileConsumer {
     deliveryTags.clear();
 }
 
+private String parseDuplicateId(String message) {
+    if (message == null) return null;
+    java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("Duplicate entry '(.+?)' for key 'PRIMARY'")
+            .matcher(message);
+    return m.find() ? m.group(1) : null;
+}
+
 private boolean isRetriable(SQLException e) {
     int code = e.getErrorCode();
     return code == 1213 // deadlock
@@ -154,13 +222,12 @@ private boolean isRetriable(SQLException e) {
 }
 
 // New fallback using INSERT IGNORE instead of normal INSERT
-private int fallbackToIndividualIgnore(List<Transaction> batch, List<String> batchLines,
-                                       List<Long> deliveryTags, Channel channel) {
+private int fallbackToIndividual(List<Transaction> batch, List<String> batchLines,
+                                  List<Long> deliveryTags, Channel channel) {
     int skipped = 0;
     for (int i = 0; i < batch.size(); i++) {
         try {
-            int result = transactionRepository.saveIgnore(batch.get(i));
-            if (result == 0) skipped++;   // duplicate
+            saveWithRetry(batch.get(i));
             channel.basicAck(deliveryTags.get(i), false);
         } catch (Exception ex) {
             totalErrors++;
@@ -171,6 +238,23 @@ private int fallbackToIndividualIgnore(List<Transaction> batch, List<String> bat
         }
     }
     return skipped;
+}
+
+private void saveWithRetry(Transaction t) throws SQLException {
+    int maxRetries = 3;
+    for (int attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            transactionRepository.save(t);
+            return;
+        } catch (SQLException e) {
+            if (e.getErrorCode() == 1062 && attempt < maxRetries) {
+                log.warn("PK collision on id={}, retry {}/{}", t.getId(), attempt + 1, maxRetries);
+                t.setId(idGenerator.generate());
+            } else {
+                throw e;
+            }
+        }
+    }
 }
     // private void saveWithRetry(Transaction transaction) throws Exception {
     //     int attempts = 0;
@@ -215,8 +299,26 @@ private int fallbackToIndividualIgnore(List<Transaction> batch, List<String> bat
                 totalDuplicates, totalErrors);
     }
 
+    private String[] splitCsv(String line) {
+        List<String> fields = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuotes = false;
+        for (char c : line.toCharArray()) {
+            if (c == '"') {
+                inQuotes = !inQuotes;
+            } else if (c == ',' && !inQuotes) {
+                fields.add(current.toString().trim());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        fields.add(current.toString().trim());
+        return fields.toArray(new String[0]);
+    }
+
     private Transaction parseLine(String line) {
-        String[] fields = line.replace("\"", "").split(",");
+        String[] fields = splitCsv(line);
         Transaction t = new Transaction();
         t.setPaymentTypeId(fields[0]);
         t.setSourceId(fields[1]);

@@ -1,8 +1,10 @@
 package com.itc;
 
 import com.itc.config.FlywayConfig;
+import com.itc.config.RabbitMQConfig;
 import com.itc.consumer.FileConsumer;
 import com.itc.producer.FileProducer;
+import com.rabbitmq.client.Channel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,10 +13,14 @@ public class Main {
 
     // Number of concurrent consumer threads. Each gets its own RabbitMQ channel
     // and its own batch buffer. Increase this to scale throughput on multi-core machines.
-    private static final int NUM_CONSUMERS = 6;
+    private static final int NUM_CONSUMERS = 10;
 
     public static void main(String[] args) throws Exception {
         FlywayConfig.migrate();
+
+        try (Channel setupChannel = RabbitMQConfig.createChannel()) {
+            RabbitMQConfig.declareQueues(setupChannel);
+        }
 
         // Start N consumer threads before the producer so they are ready to receive
         for (int i = 0; i < NUM_CONSUMERS; i++) {
@@ -41,6 +47,7 @@ public class Main {
             producerThread.join();
         } else {
             log.info("No file provided — consumers are draining the existing queue");
+            Thread.currentThread().join(); // keep JVM alive until interrupted
         }
     }
 }

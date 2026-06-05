@@ -580,6 +580,58 @@ t.setSourceId(fields[1]);
 t.setAmount(new BigDecimal(fields[16]));
 ```
 
+### The Quoted Comma Bug — Why split(",") Is Not Enough
+
+The approach above has a silent failure mode. Consider a CSV row where one field contains a comma inside quotes:
+
+```
+"MOMO","MTN","TXN001","2024-01-01 00:00:00","ACC","SRC","MOB","TERM","MERCH","PROD","SUB","REF","Smith, John","0244000000","Payment","GHS",50.00,2.50,2024,"MTN","Ghana","TRANSFER","JAN"
+```
+
+After `line.replace("\"", "")`, the quotes are gone:
+```
+MOMO,MTN,TXN001,2024-01-01 00:00:00,ACC,SRC,MOB,TERM,MERCH,PROD,SUB,REF,Smith, John,0244000000,Payment,GHS,50.00,...
+```
+
+Now `split(",")` sees the comma inside `Smith, John` as a field separator. Every field from index 13 onwards shifts by one. What was `fields[16]` (amount = `50.00`) is now `fields[17]` (currency = `GHS`). When the code calls `new BigDecimal("GHS")`, Java throws:
+
+```
+Character G is neither a decimal digit number, decimal point, nor "e" notation exponential mark.
+```
+
+The message gets nacked to the DLQ. The record never makes it to the database.
+
+The fix is a proper CSV parser that tracks whether you're inside quotes:
+
+```java
+private String[] splitCsv(String line) {
+    List<String> fields = new ArrayList<>();
+    StringBuilder current = new StringBuilder();
+    boolean inQuotes = false;
+    for (char c : line.toCharArray()) {
+        if (c == '"') {
+            inQuotes = !inQuotes;        // toggle quote state
+        } else if (c == ',' && !inQuotes) {
+            fields.add(current.toString().trim());
+            current.setLength(0);        // reset for next field
+        } else {
+            current.append(c);
+        }
+    }
+    fields.add(current.toString().trim()); // last field (no trailing comma)
+    return fields.toArray(new String[0]);
+}
+```
+
+Then `parseLine` becomes:
+```java
+String[] fields = splitCsv(line);  // was: line.replace("\"", "").split(",")
+```
+
+Commas inside quotes are now preserved as part of the field value. The field count is always correct regardless of what the data contains.
+
+This is a very common bug in data pipelines. Any time you see `split(",")` on a CSV line, ask: can any field value contain a comma? If yes — and in real-world data it almost always can (names, addresses, narrations) — the simple split will break silently on those rows.
+
 ---
 
 ## 13. Logging — SLF4J + Logback
@@ -1475,6 +1527,63 @@ Now failed messages sit in `record.queue.dlq`. You can:
 
 `basicNack` with `requeue=true` is dangerous — if the message always fails, it gets requeued forever (poison pill loop). Only use it for transient failures (e.g., DB temporarily unreachable).
 
+### Investigating the DLQ — Finding Out What Failed
+
+When the pipeline finishes and the row count in the database is lower than the CSV row count, the first place to check is the DLQ. The gap is almost always sitting there. In the RabbitMQ management UI (`http://localhost:15672`), go to **Queues and Streams** and look for `record.queue.dlq`. The message count is the number of rows that failed.
+
+To see what the actual error was, query the `logs` table:
+
+```sql
+SELECT level, source, message, payload, created_at
+FROM logs
+ORDER BY created_at DESC
+LIMIT 50;
+```
+
+`payload` contains the raw CSV line that failed. `message` contains the Java exception message. This is why the log table stores the payload — you can see exactly what data caused the failure and fix the parsing or processing logic before replaying.
+
+### Replaying from the DLQ — The Shovel Plugin
+
+Once you've fixed the bug, you need to move the failed messages back to the main queue so they get processed again. RabbitMQ's **Shovel plugin** does this — it reads messages from one queue and publishes them to another.
+
+Enable it inside the Docker container:
+
+```bash
+# Find the container name
+docker ps
+
+# Enable the plugin
+docker exec record-id-generator-rabbitmq-1 rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management
+```
+
+After enabling, refresh the management UI and go to **Queues → record.queue.dlq**. Scroll down to **Move messages**, set the destination to `record.queue`, and click Move. The failed messages are now back in the main queue. Run the consumer in drain mode to process them:
+
+```bash
+./gradlew run
+```
+
+The fixed code will parse them correctly this time. Any that still fail go back to the DLQ, keeping the failure set isolated and inspectable.
+
+### The Full Failure Cycle
+
+```
+CSV row with comma in field
+    ↓
+parseLine() → NumberFormatException → caught by callback catch block
+    ↓
+logError() → writes to logs table (payload + stack trace)
+    ↓
+basicNack(tag, false, false) → message goes to record.queue.dlq
+    ↓
+Fix the bug (splitCsv instead of split(","))
+    ↓
+Move DLQ → record.queue via Shovel
+    ↓
+Consumer processes successfully → INSERT → basicAck
+```
+
+The DLQ is not just a safety net — it's a processing inbox for your failure cases. Every failure is preserved, inspectable, and replayable. Nothing is permanently lost unless you explicitly delete the DLQ.
+
 ---
 
 ## 29. Observability — Measuring What's Happening
@@ -1540,6 +1649,50 @@ log.info("Queue depth: {}", depth);
 ```
 
 Or via the RabbitMQ Management API at `http://localhost:15672` (guest/guest by default) — the management UI shows queue depth, publish rate, and consumer rate in real time.
+
+### Reading the RabbitMQ Management UI
+
+The management UI is the fastest way to diagnose whether the pipeline is running, stalled, or broken. Here is what each number means and what to look for.
+
+**Connections tab** — shows every TCP connection from your app to RabbitMQ:
+
+| Column | What to check |
+|---|---|
+| State | Should be `running`. `blocked` means RabbitMQ's memory alarm is active. |
+| Channels | How many AMQP channels are open on this connection. 0 means the channel was closed after use (e.g. the setup channel). |
+| To client (B/s) | Data flowing FROM RabbitMQ TO your app. `2 B/s` = heartbeat only, no message delivery. If consumers are registered but this is low, RabbitMQ is not dispatching messages. |
+| From client (B/s) | Data flowing FROM your app TO RabbitMQ. Heartbeats + acks. |
+
+During a healthy load: **To client** should be KB/s or MB/s per consumer connection as messages stream in.
+
+**Queues and Streams → record.queue** — the single most useful page:
+
+| Field | Meaning |
+|---|---|
+| Ready | Messages waiting to be delivered to a consumer |
+| Unacked | Messages delivered but not yet acked (currently being processed) |
+| Consumers | Number of registered consumers. Should match `NUM_CONSUMERS`. |
+| Consumer capacity | 100% = consumers are fully utilising their prefetch quota. Low % = consumers are idle. |
+| State | `idle` = queue has consumers but is currently empty. `running` = messages flowing. |
+| Deliver (manual ack) rate | Messages/sec being sent to consumers. 0.00/s with non-zero Ready = consumers are not receiving. |
+
+**What specific states mean:**
+
+```
+Ready=98337, Unacked=0, Consumers=0
+→ No consumers connected. App is not running or failed before basicConsume.
+
+Ready=98337, Unacked=0, Consumers=10
+→ Consumers ARE registered but not receiving. RabbitMQ is connected but not dispatching.
+  Check the "To client" B/s on the Connections tab — if it's 2 B/s (heartbeat only),
+  the issue is server-side (queue state, flow control, or a silent channel error).
+
+Ready=0, Unacked=2000, Consumers=10
+→ Healthy: all Ready messages delivered, consumers are processing them.
+
+Ready=0, Unacked=0, Consumers=10, State=idle
+→ Queue is empty. Processing is complete (or producer hasn't published yet).
+```
 
 ### For Production — Micrometer + Prometheus
 
@@ -2869,7 +3022,32 @@ for (int i = 0; i < NUM_CONSUMERS; i++) {
 
 This is already in `Main.java`. A quad-core machine can run 4 consumers in parallel. Each uses one CPU core for CSV parsing and SHA-256 hashing, and one DB connection during a batch flush.
 
-**Rule of thumb**: set `NUM_CONSUMERS` to the number of CPU cores available, minus 1 for the producer thread. On a 4-core machine: 3 consumers. On an 8-core machine: 7 consumers.
+**Rule of thumb**: set `NUM_CONSUMERS` to the number of CPU cores available, minus 1 for the producer thread. On a 4-core machine: 3 consumers. On an 8-core machine: 7 consumers. In practice, the bottleneck is more often MySQL write throughput than CPU — so it is worth testing higher counts. **10 consumers ran successfully on this project's machine** without needing to be reduced, processing 5.75M rows across all 10 threads simultaneously. The initial concern that 10 connections might cause stability problems turned out to be a different bug (see the `declareQueues` race condition below) — once that was fixed, 10 consumers was completely stable.
+
+### The declareQueues Race Condition
+
+When each consumer thread calls `consume()`, the original code called `RabbitMQConfig.declareQueues(channel)` at the start — declaring the DLQ and main queue from within each consumer's own connection. With 10 consumers starting simultaneously on 10 different connections, all 10 sent `Queue.Declare` frames to RabbitMQ for the same queues at the same instant.
+
+RabbitMQ serialises concurrent declarations of the same queue internally. With 10 simultaneous requests, the server backed up and the consumer threads blocked indefinitely waiting for `Queue.DeclareOk` — no exception, no error, no log output. The connections showed as `running` in the management UI, channels were open, but `basicConsume` was never reached. Unacked stayed at 0.
+
+The diagnostic clue was the **"To client: 2 B/s"** column in the Connections tab — 2 bytes per second is just heartbeat traffic. If messages were being delivered, it would show KB/s or MB/s. Heartbeat-only traffic with consumers registered means `basicConsume` was never called.
+
+The fix: declare queues exactly **once** from the main thread before any consumer starts, then remove the call from `consume()`.
+
+```java
+// Main.java — before starting consumer threads
+try (Channel setupChannel = RabbitMQConfig.createChannel()) {
+    RabbitMQConfig.declareQueues(setupChannel);  // done once, not 10 times racing
+}
+
+// FileConsumer.consume() — declaration removed
+Channel channel = RabbitMQConfig.createChannel();
+channel.basicQos(BATCH_SIZE * 2);
+// ... no declareQueues call here anymore
+channel.basicConsume(...);
+```
+
+The rule: queue declaration is the producer's job (or the app's one-time setup job). Consumers should assume the queue exists and just consume from it.
 
 ---
 
@@ -2935,6 +3113,503 @@ If `waiting > 0` appears in HikariPool stats, the pool is too small. Increase `m
 Direct CSV-to-MySQL (without a queue) can only use one writer at a time per file — you'd need to split the file manually to parallelise. With RabbitMQ, the queue automatically distributes work to however many consumers you add, on however many machines you have. Adding a new consumer is just starting a new process — no file splitting, no coordination, no code change.
 
 This is the core value proposition of a message queue in a data pipeline.
+
+---
+
+## 38. Removing source_hash for Clean Data
+
+### What Changed and Why
+
+Section 27 explains the `source_hash` system: a SHA-256 fingerprint stored as a `UNIQUE` column so that re-running the same CSV file doesn't insert duplicates. That system was built assuming the source data might be dirty or that the pipeline might need to be re-run safely.
+
+When the data is **known to be clean** — one controlled load with no risk of re-running — the hash becomes pure overhead:
+
+- SHA-256 is computed on every row before insert (CPU cost)
+- The value is written to `source_hash VARCHAR(64)` (storage cost)
+- MySQL checks the `ux_source_hash` unique index on every insert (the biggest cost — see Section 35 on why index maintenance slows down with scale)
+
+We suspended the hash to measure raw insert throughput on clean data.
+
+### What Changed in FileConsumer.java
+
+```java
+// Before — hash computed and stored on every row
+transaction.setSourceHash(computeHash(transaction));
+transaction.setId(idGenerator.generate());
+
+// After — hash computation commented out
+// transaction.setSourceHash(computeHash(transaction));
+transaction.setId(idGenerator.generate());
+```
+
+**Import that was previously used by `computeHash`:**
+```java
+import java.security.MessageDigest;      // SHA-256 engine
+import java.security.NoSuchAlgorithmException;
+import java.nio.charset.StandardCharsets; // for .getBytes(StandardCharsets.UTF_8)
+import java.util.HexFormat;              // converts byte[] to hex string
+```
+These stay in the file because `computeHash` is still there (just not called), but if the method were removed they could be cleaned up.
+
+### What Changed in TransactionRepository.java
+
+`source_hash` was removed from all three INSERT statements and `setParams` was re-numbered:
+
+```java
+// Before — source_hash was column 2, everything else shifted by one
+INSERT INTO transactions (
+    id, source_hash, payment_type_id, ...
+) VALUES (?, ?, ?, ...)
+stmt.setString(2, t.getSourceHash());
+stmt.setString(3, t.getPaymentTypeId());
+
+// After — source_hash removed, 24 columns instead of 25
+INSERT INTO transactions (
+    id, payment_type_id, ...
+) VALUES (?, ?, ...)
+stmt.setString(2, t.getPaymentTypeId());
+```
+
+The `source_hash` column still exists in the database schema — it just receives `NULL` values. No migration needed. Flyway's V2 migration that created the column and index is unchanged; the index is still there, it just has no data in it.
+
+### Performance Impact
+
+Removing one `UNIQUE VARCHAR(64)` index from a table means:
+- Every insert no longer triggers a B-tree lookup + possible page split on that index
+- The `ux_source_hash` index stays empty, so those B-tree pages stay small and cold (irrelevant)
+- MySQL only needs to maintain the primary key index (`id VARCHAR(12)`)
+
+This is a meaningful speedup when inserting millions of rows. The tradeoff: if you re-run the same file, every row inserts again — duplicates in the database.
+
+### When to Bring It Back
+
+Re-enable both the hash computation and the `source_hash` column insert when:
+- The pipeline needs to be idempotent (re-runs are safe)
+- Source data might contain duplicates that should be silently skipped
+- You are in production and cannot afford to re-examine every row manually
+
+For development load-testing with known-clean CSVs, suspending it is the right call.
+
+---
+
+## 39. PK Collision — Find the Specific Row, Not the Whole Batch
+
+### The Original Problem
+
+When a bulk INSERT fails with a primary key collision (MySQL error 1062), the previous fallback strategy was:
+
+```
+Batch of 10,000 fails → retry every row one by one (10,000 individual inserts)
+```
+
+One collision penalises 9,999 innocent rows with individual round-trips. That batch becomes 50–100x slower than a normal batch flush.
+
+### The New Strategy — Parse the MySQL Error Message
+
+MySQL's 1062 error message always includes the duplicate key value:
+
+```
+Duplicate entry '047382910564' for key 'PRIMARY'
+```
+
+We extract that value with a regex, find the one transaction in the batch whose ID matches, regenerate just that ID, and retry the whole batch:
+
+```java
+// In flushBatch() — the retry loop
+for (int attempt = 0; attempt <= maxPkRetries; attempt++) {
+    try {
+        skipped = transactionRepository.saveBatch(batch);
+        break;  // success
+    } catch (SQLException e) {
+        if (e.getErrorCode() == 1062 && attempt < maxPkRetries) {
+            String dupId = parseDuplicateId(e.getMessage());
+            if (dupId == null) throw e;
+            batch.stream()
+                 .filter(t -> dupId.equals(t.getId()))
+                 .findFirst()
+                 .ifPresent(t -> {
+                     log.warn("PK collision on id={}, retry {}/{}", dupId, currentAttempt + 1, maxPkRetries);
+                     t.setId(idGenerator.generate());
+                 });
+        } else if (isRetriable(e)) {
+            // deadlock/lock timeout → individual fallback (different problem)
+            skipped = fallbackToIndividual(batch, batchLines, deliveryTags, channel);
+            break;
+        } else {
+            throw e;
+        }
+    }
+}
+
+// Helper — extracts the colliding value from MySQL's error message
+private String parseDuplicateId(String message) {
+    if (message == null) return null;
+    java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("Duplicate entry '(.+?)' for key 'PRIMARY'")
+            .matcher(message);
+    return m.find() ? m.group(1) : null;
+}
+```
+
+**Imports used:**
+```java
+import java.util.regex.Matcher;   // not needed — we used the fully-qualified name inline
+import java.util.regex.Pattern;   // same — Pattern.compile() called inline
+```
+
+We used fully-qualified names (`java.util.regex.Pattern`) inside the method to avoid adding imports for a one-off helper. Either way is fine.
+
+### The Lambda Effectively-Final Problem
+
+Java requires variables used inside lambdas to be **effectively final** — their value cannot change after the lambda is written. `attempt` is a loop variable that changes every iteration, so it can't be used directly inside `ifPresent`:
+
+```java
+// Compile error — attempt is not effectively final
+.ifPresent(t -> log.warn("retry {}", attempt + 1, maxPkRetries));
+
+// Fix — capture the current value in a new final variable
+final int currentAttempt = attempt;
+.ifPresent(t -> log.warn("retry {}", currentAttempt + 1, maxPkRetries));
+```
+
+`currentAttempt` is assigned once and never changes, so Java accepts it inside the lambda. This is a very common pattern whenever you need a loop variable inside a lambda.
+
+### Why Three Lists Instead of a Map
+
+The batch is stored as three parallel lists (`batch`, `batchLines`, `deliveryTags`), not as a list of objects that bundle all three together. Index `i` in all three always refers to the same original message.
+
+The stream search (`batch.stream().filter(t -> dupId.equals(t.getId()))`) only searches the `batch` list. Once found, the transaction object's ID is mutated in place — the corresponding entry in `batchLines` and `deliveryTags` is unaffected, because those don't store the ID. The lists stay in sync with no extra bookkeeping.
+
+---
+
+## 40. Per-Consumer Connections — Removing the Shared Reader Thread
+
+### Original Design — One Shared Connection
+
+`RabbitMQConfig` originally had a **static** `Connection`:
+
+```java
+public class RabbitMQConfig {
+    private static Connection connection;  // ONE connection, shared by everything
+
+    static {
+        // runs once at class load
+        connection = factory.newConnection();
+    }
+
+    public static Channel createChannel() throws IOException {
+        return connection.createChannel();  // all channels share this one connection
+    }
+}
+```
+
+All 6 (later 10) consumers called `createChannel()` and got channels on the same underlying TCP connection.
+
+### The Problem — One Reader Thread for All Consumers
+
+A RabbitMQ `Connection` has one **reader thread** — a single thread that reads all AMQP frames off the TCP socket and routes them to the correct channel. With 6 consumers sharing one connection:
+
+```
+RabbitMQ server
+     │
+     TCP socket (one reader thread)
+     │
+     ├─ channel-1 → consumer-1 callback
+     ├─ channel-2 → consumer-2 callback
+     ├─ channel-3 → consumer-3 callback
+     ├─ channel-4 → consumer-4 callback
+     ├─ channel-5 → consumer-5 callback
+     └─ channel-6 → consumer-6 callback
+```
+
+All 6 consumers' messages had to pass through that single reader thread. With 140,000+ messages in the queue, the reader thread became the bottleneck — it was routing frames faster than it could keep up under load.
+
+### The Fix — One Connection Per Consumer
+
+```java
+public class RabbitMQConfig {
+    private static final ConnectionFactory factory;  // factory is shared, connections are not
+
+    static {
+        factory = new ConnectionFactory();
+        factory.setHost(props.getProperty("rabbitmq.host"));
+        // ... other config ...
+    }
+
+    // Each call creates a fresh Connection → its own reader thread
+    public static Channel createChannel() throws IOException, TimeoutException {
+        return factory.newConnection().createChannel();
+    }
+}
+```
+
+Now each consumer gets its own TCP connection when it calls `createChannel()`. Each connection has its own reader thread:
+
+```
+RabbitMQ server
+     │
+     ├─ TCP connection-1 (reader thread 1) → consumer-1
+     ├─ TCP connection-2 (reader thread 2) → consumer-2
+     ├─ TCP connection-3 (reader thread 3) → consumer-3
+     ├─ TCP connection-4 (reader thread 4) → consumer-4
+     ├─ TCP connection-5 (reader thread 5) → consumer-5
+     └─ TCP connection-6 (reader thread 6) → consumer-6
+```
+
+Message delivery to all 6 consumers now happens in parallel. No single reader thread is a bottleneck.
+
+**Import change:** `createChannel()` now throws `TimeoutException` (because `factory.newConnection()` can time out), so the method signature changed from `throws IOException` to `throws IOException, TimeoutException`. This required updating `consume()` in `FileConsumer` — but `consume()` already declared `throws java.util.concurrent.TimeoutException`, so no change was needed there.
+
+**Why the channel stays alive after `consume()` returns:** the `channel` local variable is captured by the callback lambda and the scheduler lambda. Java keeps it alive as long as those lambdas are referenced. The connection behind the channel stays alive because the channel references it internally, and the connection's reader/writer threads are GC roots.
+
+---
+
+## 41. Timed Flush — Draining the Tail Without a Full Batch
+
+### The Problem — Partial Batches That Never Flush
+
+Each consumer only flushes when its batch reaches `BATCH_SIZE` (10,000 rows). With 140,000 messages remaining in the queue across 10 consumers:
+
+```
+140,000 / 10 = 14,000 messages per consumer
+14,000 / 10,000 = 1 full flush + 4,000 leftover
+```
+
+Those 4,000 leftover messages per consumer sit in the in-memory batch list. They are **unacked in RabbitMQ** (held but not yet acknowledged). Since `BATCH_SIZE` is never reached again (the queue is empty), they are never flushed. The database never receives them. The consumers just sit there waiting for a batch that will never fill up.
+
+### The Fix — ScheduledExecutorService
+
+A `ScheduledExecutorService` fires a "timed flush" every `FLUSH_INTERVAL_SECONDS` seconds. If the batch has anything in it, it's flushed immediately regardless of size:
+
+```java
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+// In FileConsumer fields:
+private static final int FLUSH_INTERVAL_SECONDS = 10;
+private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+
+// In consume():
+scheduler.scheduleAtFixedRate(() -> {
+    List<Transaction> batchSnapshot;
+    List<String>      linesSnapshot;
+    List<Long>        tagsSnapshot;
+
+    synchronized (batchLock) {
+        if (batch.isEmpty()) return;          // nothing to flush
+        batchSnapshot = new ArrayList<>(batch);
+        linesSnapshot = new ArrayList<>(batchLines);
+        tagsSnapshot  = new ArrayList<>(deliveryTags);
+        batch.clear();
+        batchLines.clear();
+        deliveryTags.clear();
+    }
+
+    log.info("Timed flush: flushing {} buffered messages", batchSnapshot.size());
+    submitFlush(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
+
+}, FLUSH_INTERVAL_SECONDS, FLUSH_INTERVAL_SECONDS, TimeUnit.SECONDS);
+```
+
+**`scheduleAtFixedRate(task, initialDelay, period, unit)`** — runs `task` after `initialDelay`, then again every `period`. If the task throws an unchecked exception, future executions are silently cancelled (this is a known gotcha — wrap the task body in try-catch if exceptions are possible).
+
+### Thread Safety — Why synchronized Is Needed
+
+The RabbitMQ callback runs on RabbitMQ's internal `ConsumerWorkService` thread. The scheduler runs on its own thread. Both threads touch the same `batch`, `batchLines`, and `deliveryTags` lists.
+
+Without synchronisation, two threads modifying a non-thread-safe `ArrayList` simultaneously causes `ConcurrentModificationException` or silent data corruption (lists appearing to have inconsistent lengths, entries pointing to the wrong index).
+
+The fix is a **lock object** shared by both threads:
+
+```java
+private final Object batchLock = new Object();
+```
+
+Every access to the batch is wrapped:
+
+```java
+// In the RabbitMQ callback:
+synchronized (batchLock) {
+    batch.add(transaction);
+    batchLines.add(line);
+    deliveryTags.add(delivery.getEnvelope().getDeliveryTag());
+
+    if (batch.size() >= BATCH_SIZE) {
+        // snapshot and clear inside the lock
+    }
+}
+
+// In the scheduler:
+synchronized (batchLock) {
+    if (batch.isEmpty()) return;
+    // snapshot and clear inside the lock
+}
+```
+
+`synchronized (batchLock)` means: only one thread can execute this block at a time. If the callback is in the middle of `batch.add()`, the scheduler waits until the lock is released before snapshotting. This prevents partial reads and concurrent modification.
+
+The actual flush (`submitFlush`) happens **outside** the lock — there's no reason to hold the lock while talking to MySQL. Only the list operations need protection.
+
+### submitFlush — Extracting the Flush Submission
+
+To avoid duplicating the `flushExecutor.submit(...)` lambda in both the batch-full path and the timed flush path, a private helper method was extracted:
+
+```java
+private void submitFlush(Channel channel, List<Transaction> batchSnapshot,
+                          List<String> linesSnapshot, List<Long> tagsSnapshot) {
+    flushExecutor.submit(() -> {
+        try {
+            flushBatch(channel, batchSnapshot, linesSnapshot, tagsSnapshot);
+        } catch (Exception e) {
+            log.error("Flush failed, nacking {} messages to DLQ: {}", tagsSnapshot.size(), e.getMessage(), e);
+            for (Long tag : tagsSnapshot) {
+                try { channel.basicNack(tag, false, false); } catch (IOException ignored) {}
+            }
+        }
+    });
+}
+```
+
+Both the batch-full path and the timed flush path call `submitFlush`. The `flushExecutor` is single-threaded, so flushes are serialised — they never run concurrently, even if both the batch-full condition and the timer fire at the same moment.
+
+---
+
+## 42. Double-Buffering — Eliminating the Idle Gap With 2x Prefetch
+
+### The Idle Gap Problem
+
+With `basicQos(BATCH_SIZE)` (prefetch = 10,000) and a MySQL insert that takes 25 seconds, here is what a consumer's timeline looks like:
+
+```
+t=0s:   RabbitMQ delivers 10,000 messages (prefetch quota filled)
+t=0s:   Batch fills up → flush submitted to flushExecutor
+t=0s:   Consumer is now idle — all 10,000 messages are "unacked", prefetch quota full
+        RabbitMQ won't send more until some are acked
+t=25s:  MySQL insert completes
+t=25s:  basicAck sent — all 10,000 messages acked
+t=25s:  RabbitMQ delivers next 10,000 messages
+t=25s:  Consumer idle again while next batch accumulates
+...
+```
+
+The consumer is **idle for 25 seconds** waiting for the MySQL insert. That idle time is wasted throughput.
+
+### The Fix — basicQos(BATCH_SIZE * 2)
+
+With prefetch set to twice the batch size:
+
+```java
+channel.basicQos(BATCH_SIZE * 2);  // was: BATCH_SIZE
+```
+
+The timeline becomes:
+
+```
+t=0s:   RabbitMQ delivers 20,000 messages (new prefetch quota)
+t=0s:   First 10,000 fill the batch → flush submitted → MySQL insert begins
+t=0s:   Consumer continues receiving messages 10,001–20,000 into the NEXT batch
+t=10s:  Second batch fills (10,000 more messages) → timed flush fires or batch full
+t=25s:  First MySQL insert completes → ack sent for first 10,000
+t=25s:  RabbitMQ can now deliver another 10,000 (quota is back at 10,000 available)
+t=25s:  Second MySQL insert completes → ack sent → third batch begins
+```
+
+The consumer now has the **next batch ready** as soon as the current insert finishes. MySQL inserts continuously with no gap between them.
+
+### Why This Works — The flushExecutor Queue
+
+`flushExecutor` is a single-threaded executor. When the second batch fills while the first flush is still running, the second flush task is **queued** in the executor. The moment the first flush completes, the executor immediately picks up the second task. No waiting.
+
+```
+flushExecutor queue:
+  [flush batch 1] → running (MySQL insert, 25 seconds)
+  [flush batch 2] → waiting  ← filled during batch 1's insert
+  
+After batch 1 completes:
+  [flush batch 2] → now running immediately (no idle gap)
+  [flush batch 3] → waiting (being filled while batch 2 inserts)
+```
+
+The practical effect: instead of MySQL being busy 50% of the time (25s insert, 25s idle), it is busy nearly 100% of the time.
+
+### The Trade-Off
+
+Doubling the prefetch means up to `2 × BATCH_SIZE` messages are "in-flight" (unacked) in the consumer's memory at any time. For `BATCH_SIZE = 10,000`, that's 20,000 messages held in memory. Each message is a CSV line (~200–500 bytes), so ~4–10MB per consumer — negligible.
+
+The risk: if the consumer crashes with 20,000 unacked messages instead of 10,000, RabbitMQ redelivers 20,000 rows on the next run. With the clean-data assumption (no `source_hash`), those rows would be inserted again. This is only a problem if: (a) the table was NOT truncated before re-running AND (b) you care about duplicate rows.
+
+---
+
+## 43. JVM Keepalive — Why Drain Mode Was Silently Exiting
+
+### The Problem
+
+`basicConsume` is **non-blocking**. It registers a callback with RabbitMQ's internal thread pool and returns immediately. The consumer thread that called `consume()` then exits:
+
+```java
+// In Main.java — what happens when no file is provided:
+for (int i = 0; i < NUM_CONSUMERS; i++) {
+    Thread t = new Thread(() -> consumer.consume());
+    t.start();  // consumer.consume() returns in milliseconds
+}
+
+log.info("No file provided — consumers are draining the existing queue");
+// main() returns here → JVM checks for remaining non-daemon threads → finds none → exits
+```
+
+After all 10 consumer threads call `consume()` and return, the JVM has no more user threads keeping it alive. It exits — closing all RabbitMQ connections and abandoning any messages that were in transit.
+
+RabbitMQ logs this as `client unexpectedly closed TCP connection`, which is exactly what it was.
+
+### Why the Producer Run Didn't Have This Problem
+
+When the producer is running (`args.length > 0`), `main()` calls `producerThread.join()` — which blocks the main thread until the producer finishes. The main thread staying alive kept the JVM alive throughout the entire producer + consumer run. Drain mode (no producer) had no such anchor.
+
+### The Fix
+
+```java
+} else {
+    log.info("No file provided — consumers are draining the existing queue");
+    Thread.currentThread().join();  // block main thread forever (until Ctrl+C)
+}
+```
+
+`Thread.currentThread().join()` tells the current thread to wait for itself to finish — which never happens. The main thread blocks indefinitely, keeping the JVM alive while the consumers and their scheduler/executor threads do their work.
+
+When you press Ctrl+C, the JVM receives `SIGINT`, the shutdown sequence begins, and all threads are cleanly terminated.
+
+**Why not `Thread.sleep(Long.MAX_VALUE)`?** Both work. `join()` is semantically cleaner — "wait for this thread to die" rather than "sleep for 292 years". In practice there is no observable difference.
+
+### The Non-Daemon Thread Subtlety
+
+Java has two kinds of threads:
+- **User threads** (non-daemon) — the JVM stays alive as long as any of these exist
+- **Daemon threads** — the JVM can exit even if these are still running (e.g., GC thread)
+
+`Executors.newSingleThreadScheduledExecutor()` and `Executors.newSingleThreadExecutor()` create **non-daemon** threads by default. So the scheduler and flushExecutor threads should technically keep the JVM alive even without the `join()`. In practice, the thread may not be created until the first task is submitted — if `consume()` returns before the first task fires (10 seconds for the scheduler), there is a window where no non-daemon threads exist. The `join()` on the main thread closes that window entirely, no matter what the executor threads do.
+
+---
+
+## 44. Summary of Changes — This Session
+
+The table below is a condensed record of what changed, why, and what you would look for in the code.
+
+| Change | File | Why | What to look for |
+|---|---|---|---|
+| `source_hash` computation commented out | `FileConsumer.java` | Clean data — hash overhead not needed | `// transaction.setSourceHash(...)` |
+| `source_hash` removed from all INSERTs | `TransactionRepository.java` | Matches above — no hash, no column | 24 params instead of 25 in `setParams` |
+| INSERT IGNORE → plain INSERT | `TransactionRepository.java` | No dedup needed; surfacing real errors | `INSERT INTO` not `INSERT IGNORE INTO` |
+| PK collision: parse error, fix one row, retry batch | `FileConsumer.java` | 1 collision shouldn't cost 9,999 rows | `parseDuplicateId()`, loop in `flushBatch()` |
+| Shared `Connection` → per-consumer `Connection` | `RabbitMQConfig.java` | One reader thread was a bottleneck | `factory.newConnection()` inside `createChannel()` |
+| `NUM_CONSUMERS` 6 → 10 | `Main.java` | More parallel inserts — 10 ran stably | `private static final int NUM_CONSUMERS = 10` |
+| HikariCP pool 20 → 30 | `DatabaseConfig.java` | Cover 10 consumers with headroom | `config.setMaximumPoolSize(30)` |
+| `batchLock` + `synchronized` | `FileConsumer.java` | Scheduler + callback on different threads | `private final Object batchLock` |
+| `ScheduledExecutorService scheduler` | `FileConsumer.java` | Tail-end partial batches never flushed | `Executors.newSingleThreadScheduledExecutor()` |
+| `basicQos(BATCH_SIZE)` → `basicQos(BATCH_SIZE * 2)` | `FileConsumer.java` | Eliminate idle gap between inserts | `channel.basicQos(BATCH_SIZE * 2)` |
+| `Thread.currentThread().join()` in drain mode | `Main.java` | JVM was exiting before consumers finished | In the `else` branch of `if (args.length > 0)` |
+| `declareQueues` moved to `Main.java` | `Main.java` / `FileConsumer.java` | 10 threads simultaneously declaring the same queue caused a silent deadlock | `try (Channel setup = ...) { declareQueues(setup); }` before consumer loop |
+| `splitCsv()` replaces `split(",")` | `FileConsumer.java` | Quoted fields containing commas shifted all column indices | `splitCsv(line)` in `parseLine()` |
+| Shovel plugin for DLQ replay | RabbitMQ container | Move failed messages back to main queue after fixing the bug | `docker exec <container> rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management` |
 
 ---
 

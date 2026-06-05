@@ -26,7 +26,7 @@ public class DatabaseConfig {
         config.setPassword(props.getProperty("db.password"));
         // Each consumer thread needs its own connection during a batch flush.
         // Set this to at least NUM_CONSUMERS (in Main.java) + a few for Flyway and overhead.
-        config.setMaximumPoolSize(20);
+        config.setMaximumPoolSize(30);
 
         dataSource = new HikariDataSource(config);
     }

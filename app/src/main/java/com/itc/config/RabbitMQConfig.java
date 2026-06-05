@@ -1,7 +1,7 @@
 package com.itc.config;
 
 import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
+// import com.rabbitmq.client.Connection;
 import com.rabbitmq.client.ConnectionFactory;
 
 import java.io.IOException;
@@ -12,7 +12,7 @@ import java.util.Properties;
 import java.util.concurrent.TimeoutException;
 
 public class RabbitMQConfig {
-    private static Connection connection;
+    private static final ConnectionFactory factory;
     private static final String QUEUE_NAME;
     private static final String DLQ_NAME;
 
@@ -24,25 +24,20 @@ public class RabbitMQConfig {
             throw new RuntimeException("Failed to load application.properties", e);
         }
 
-        ConnectionFactory factory = new ConnectionFactory();
+        factory = new ConnectionFactory();
         factory.setHost(props.getProperty("rabbitmq.host"));
         factory.setPort(Integer.parseInt(props.getProperty("rabbitmq.port")));
         factory.setUsername(props.getProperty("rabbitmq.user"));
         factory.setPassword(props.getProperty("rabbitmq.pass"));
         factory.setRequestedHeartbeat(30);
 
-        try {
-            connection = factory.newConnection();
-        } catch (IOException | TimeoutException e) {
-            throw new RuntimeException("Failed to connect to RabbitMQ", e);
-        }
-
         QUEUE_NAME = props.getProperty("rabbitmq.queue");
         DLQ_NAME = QUEUE_NAME + ".dlq";
     }
 
-    public static Channel createChannel() throws IOException {
-        return connection.createChannel();
+    // Each caller gets its own connection — avoids the single shared reader thread bottleneck.
+    public static Channel createChannel() throws IOException, TimeoutException {
+        return factory.newConnection().createChannel();
     }
 
     public static String getQueueName() {
