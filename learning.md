@@ -545,6 +545,80 @@ while (attempts < 3) {
 }
 ```
 
+### Exact Collision Probability — The Birthday Paradox Math
+
+With 12 random decimal digits (k = 10^12 possible values) and n records, the expected number of collisions across the whole dataset is:
+
+```
+Expected collisions ≈ n² / (2k)
+```
+
+For 5.75M rows:
+```
+(5,750,000)² / (2 × 1,000,000,000,000) ≈ 16 collisions
+```
+
+So across a 5.75M row load you expect roughly **16 rows** to hit a collision — the retry loop fires 16 times and regenerates 16 IDs. Essentially zero impact on performance or correctness.
+
+The 1-in-2-million threshold (where each new insert has a ~50% chance of colliding) is reached at roughly √(10^12) = **1 million rows**. Before that, collisions are extremely rare. After it, they become more frequent but still manageable with a retry limit of 3.
+
+### In-Memory Dedup for Bulk Loads (No DB Round-Trip)
+
+When the unique index is dropped during a bulk load (for speed — see Section 35), the DB can no longer catch collisions. Instead, track used IDs in a Java set before they ever reach the DB:
+
+**HashSet\<Long\> (single-threaded, e.g. BulkLoader)**
+```java
+Set<Long> usedIds = new HashSet<>(8_000_000); // pre-sized
+String id = idGenerator.generate();
+while (!usedIds.add(Long.parseLong(id))) {    // add() returns false if already present
+    id = idGenerator.generate();
+}
+// id is now guaranteed unique within this load
+```
+
+**ConcurrentHashMap.newKeySet() (shared across threads)**
+
+When multiple consumer threads each generate IDs independently, they can collide with each other — not just with the DB. A thread-safe shared set prevents cross-thread duplicates:
+
+```java
+// In Main.java — created once, passed to all consumers
+Set<Long> usedIds = ConcurrentHashMap.newKeySet(8_000_000);
+
+// In FileConsumer — shared across all 10 consumers
+private String generateUniqueId() {
+    String id = idGenerator.generate();
+    while (!usedIds.add(Long.parseLong(id))) {
+        id = idGenerator.generate();
+    }
+    return id;
+}
+```
+
+### Memory Cost and Alternatives
+
+Storing 5.75M longs in a `ConcurrentHashMap` costs roughly **250–300MB** (boxed `Long` ≈ 48 bytes per entry including node overhead). For larger files this grows linearly:
+
+| File size | ConcurrentHashMap | Bloom filter |
+|---|---|---|
+| 5.75M rows | ~300MB | ~6MB |
+| 50M rows | ~2.4GB | ~60MB |
+| 500M rows | OutOfMemoryError | ~600MB |
+
+**Bloom filter** (Guava): probabilistic, uses 50× less memory. Can have false positives (says "seen" when it hasn't — causes an unnecessary regeneration) but never false negatives (never misses an actual collision). For ID dedup, false positives are harmless — you just generate another ID.
+
+```java
+// build.gradle.kts: implementation("com.google.guava:guava:33.0.0-jre")
+BloomFilter<Long> seen = BloomFilter.create(
+    Funnels.longFunnel(), 50_000_000, 0.001); // 50M entries, 0.1% false positive rate
+```
+
+**Post-load dedup check**: no in-memory tracking at all. Load everything (index dropped), then find collisions with SQL after:
+```sql
+SELECT generated_id, COUNT(*) FROM transactions
+GROUP BY generated_id HAVING COUNT(*) > 1;
+```
+Update those ~16 rows with fresh IDs, then create the unique index. Memory cost: zero during load.
+
 ---
 
 ## 12. CSV Parsing at Scale
@@ -1320,6 +1394,8 @@ UUID v7 encodes a millisecond timestamp in the first 48 bits, then random bits. 
 
 No built-in Java support yet — use a library like `uuid-creator`.
 
+**UUID v4 and the random insert problem**: UUID v4 is fully random (128 bits). When used as a primary key or in a unique index, every new row lands at a random position in the B-tree — causing constant page splits, exactly like the random VARCHAR(12) PK problem described in Section 30. At scale (millions of rows), throughput degrades badly. UUID v7 solves this because the timestamp prefix keeps new rows near the right end of the index tree.
+
 #### 3. Snowflake ID (Twitter's Approach)
 
 A 64-bit integer composed of:
@@ -1610,6 +1686,24 @@ if (messagesProcessed % 10_000 == 0) {
 }
 ```
 
+**The lifetime rate is a lie (measurement artifact).** `totalProcessed / elapsed` is a cumulative average from the moment the app started. Early batches look fast because `elapsed` is small. As time grows, the number drags toward the true long-term average even if every batch runs at identical speed — creating a perception of slowing that is partly just math.
+
+Always log **both** per-batch rate and lifetime rate:
+
+```java
+private void logStats(int batchSize, int skipped, long batchMs) {
+    long elapsed = System.currentTimeMillis() - startTime;
+    double batchRate    = batchMs > 0 ? (batchSize - skipped) / (batchMs / 1000.0) : 0;
+    double lifetimeRate = totalProcessed / (elapsed / 1000.0);
+    log.info("Batch {}: inserted={} skipped={} in {}ms | batch={}/s lifetime={}/s total={} dupes={} errors={}",
+            batchSize, batchSize - skipped, skipped, batchMs,
+            String.format("%.0f", batchRate), String.format("%.0f", lifetimeRate),
+            totalProcessed, totalDuplicates, totalErrors);
+}
+```
+
+`batchRate` tells you actual instantaneous throughput. `lifetimeRate` tells you overall progress. If `batchRate` is stable but `lifetimeRate` looks like it's declining, that's the math artifact — not a real slowdown.
+
 #### 2. Batch insert latency
 
 How long does each `executeBatch()` take? Spikes indicate DB pressure.
@@ -1780,6 +1874,58 @@ This way:
 - You can query by either — `WHERE id = ?` for internal lookups, `WHERE source_hash = ?` for deduplication checks
 
 The generated ID is fine as a PK. The problem it *doesn't* solve (idempotency) is what `source_hash` solves.
+
+### The Clustered Index Problem — Why a Random VARCHAR PK Gets Slower Over Time
+
+In InnoDB (MySQL's storage engine), the **primary key IS the table**. Rows are physically stored inside the B-tree, ordered by the PK value. This is called a **clustered index**.
+
+When the PK is random (e.g. `VARCHAR(12)` filled with random digits), every new row has to be inserted at a random position in the tree. When the target leaf page is full, InnoDB splits it into two half-full pages and updates the parent — this is a **page split**. As the table grows:
+
+- Page splits happen constantly (random inserts always find full pages)
+- The tree gets taller → more levels to traverse per insert
+- The working set grows beyond the buffer pool → disk reads
+
+Observed impact: batch throughput starts fast and degrades with every batch until the pipeline takes hours instead of minutes.
+
+### The Fix — V3 Migration: BIGINT AUTO_INCREMENT Clustered Key
+
+Swap the PK to a sequential `BIGINT AUTO_INCREMENT`. Every new row appends to the right end of the tree — no splits, no random positioning. The random business ID moves to a separate `generated_id` column with a secondary unique index.
+
+```sql
+-- V3__optimize_pk.sql
+ALTER TABLE transactions
+    DROP INDEX ux_source_hash,
+    DROP COLUMN source_hash,
+    MODIFY COLUMN id BIGINT NOT NULL AUTO_INCREMENT,   -- sequential, no B-tree splits
+    ADD COLUMN generated_id VARCHAR(12) NOT NULL DEFAULT '' AFTER id,
+    ADD UNIQUE INDEX ux_generated_id (generated_id);   -- secondary index on random values
+```
+
+Updated schema:
+
+| Column | Type | Role |
+|---|---|---|
+| `id` | `BIGINT AUTO_INCREMENT` | Clustered key — sequential, no page splits |
+| `generated_id` | `VARCHAR(12) UNIQUE` | Business ID — random, in a secondary index |
+
+**Why secondary index splits are less severe**: a secondary index only stores the key + a pointer to the row. The pages are smaller. Splits still happen (random values), but they don't involve moving actual row data. The main improvement is eliminating clustered index splits, which are far more expensive.
+
+In Java, `id` is never set — MySQL handles it. Only `generated_id` is set from `IdGeneratorService`:
+
+```java
+// Before (random varchar was the PK)
+transaction.setId(idGenerator.generate());
+
+// After (random string is a business key, db handles the real PK)
+transaction.setGeneratedId(idGenerator.generate());
+```
+
+**Important:** V3 requires an empty `transactions` table. Drop the Docker volume and restart before loading so all three migrations run on clean tables:
+
+```bash
+docker compose -f docker-compose.dev.yml down -v
+docker compose -f docker-compose.dev.yml up -d
+```
 
 ---
 
@@ -2817,6 +2963,88 @@ For a one-time bulk load of a CSV file, the drop-then-rebuild pattern is always 
 
 ---
 
+### LOAD DATA LOCAL INFILE — The Fastest Bulk Path
+
+For one-time file loads where RabbitMQ isn't required, MySQL's native bulk loader is 5–20× faster than JDBC batch inserts. It bypasses the normal insert engine entirely.
+
+**Setup (both client and server must opt in):**
+
+```properties
+# application.properties — client side
+db.url=jdbc:mysql://localhost:3306/new_db?rewriteBatchedStatements=true&allowMultiQueries=true&allowLoadLocalInfile=true
+```
+
+```yaml
+# docker-compose.dev.yml — server side
+mysql:
+  command: >
+    --innodb-flush-log-at-trx-commit=2
+    --innodb-buffer-pool-size=2G
+    --innodb-redo-log-capacity=2G
+    --local-infile=1          # ← required — disabled by default in MySQL 8
+```
+
+If either side is missing, MySQL throws: `Loading local data is disabled; this must be enabled on both the client and server sides`.
+
+**The three-step flow (implemented in `BulkLoader.java`):**
+
+```
+Step 1 — Pre-process (~44s for 5.75M rows):
+  Stream CSV line by line
+  For each row: generate ID, check HashSet<Long>, regenerate if collision
+  Write "generated_id,original_csv_line" to a temp file
+
+Step 2 — Load (~60-90s):
+  DROP INDEX ux_generated_id         ← no per-row B-tree maintenance
+  LOAD DATA LOCAL INFILE temp_file   ← MySQL reads directly from client disk
+  SELECT ROW_COUNT()                 ← actual rows loaded
+  CREATE UNIQUE INDEX ux_generated_id ← bulk sort + build in one pass
+
+Step 3 — Cleanup:
+  Files.deleteIfExists(tempFile)
+```
+
+```java
+// The LOAD DATA statement via JDBC
+String sql = """
+        LOAD DATA LOCAL INFILE '%s'
+        INTO TABLE transactions
+        FIELDS TERMINATED BY ','
+        OPTIONALLY ENCLOSED BY '"'
+        LINES TERMINATED BY '\\n'
+        (generated_id, payment_type_id, source_id, ...)
+        """.formatted(tempFile.toAbsolutePath().toString().replace("\\", "/"));
+
+try (Connection conn = DatabaseConfig.getConnection();
+     Statement stmt = conn.createStatement()) {
+    stmt.execute("ALTER TABLE transactions DROP INDEX ux_generated_id");
+    stmt.execute(sql);
+    // ROW_COUNT() gives actual rows loaded
+    stmt.execute("CREATE UNIQUE INDEX ux_generated_id ON transactions(generated_id)");
+}
+```
+
+**Run via the `--bulk` flag (separate from the RabbitMQ pipeline):**
+
+```bash
+./gradlew run --args="--bulk /path/to/transactions.csv"
+```
+
+**Measured performance on 5.75M rows / 1.5GB:**
+
+| Phase | Time |
+|---|---|
+| Pre-processing (ID gen + temp file write) | ~44s |
+| LOAD DATA LOCAL INFILE | ~60-90s |
+| Index rebuild | ~60-90s |
+| **Total** | **~7 minutes** |
+
+Compared to ~13 minutes for the RabbitMQ pipeline. The 6-minute gap is RabbitMQ overhead — publishing 5.75M messages, receiving and parsing them in consumers, and the extra network round trips. The MySQL write phase itself is equally fast in both paths (index dropped, sequential inserts).
+
+**`LOCAL` means the file comes from the client** (wherever Java is running), not the MySQL server. This works correctly even when MySQL is inside Docker — the file transfers from the host over the client connection.
+
+---
+
 ## 36. File Descriptors — Why RabbitMQ Warns About File Handles
 
 ### What the Warning Means
@@ -3105,6 +3333,47 @@ config.setMaximumPoolSize(20);  // covers 4 consumers with room to spare
 ```
 
 If `waiting > 0` appears in HikariPool stats, the pool is too small. Increase `maximumPoolSize` (and check MySQL's `max_connections` allows it).
+
+---
+
+### Cross-Consumer ID Dedup — The Shared Set Problem
+
+When the unique index is dropped for speed (drop-then-rebuild pattern), each consumer independently generates IDs with no DB-level safety net. Two consumers can generate the same `generated_id` simultaneously and both insert it — silent duplicates in the database.
+
+A per-consumer `HashSet` only prevents collisions within one consumer's own generated IDs. It can't see what the other 9 consumers have generated.
+
+**The fix: a shared `ConcurrentHashMap.newKeySet()` passed to all consumers at startup:**
+
+```java
+// Main.java — file-load mode only
+Set<Long> usedIds = ConcurrentHashMap.newKeySet(8_000_000);
+
+// Each consumer gets the same set reference
+FileConsumer consumer = new FileConsumer(usedIds);
+```
+
+```java
+// FileConsumer.java — the set is checked atomically
+private String generateUniqueId() {
+    if (usedIds == null) return idGenerator.generate();  // drain mode: index handles it
+    String id = idGenerator.generate();
+    while (!usedIds.add(Long.parseLong(id))) {           // add() is atomic in ConcurrentHashMap
+        id = idGenerator.generate();
+    }
+    return id;
+}
+```
+
+`ConcurrentHashMap.newKeySet()` is thread-safe — multiple threads calling `add()` simultaneously is safe with no external synchronisation. `add()` returns `false` if the value was already present, `true` if newly added. The `while` loop retries until the current thread successfully "claims" the ID.
+
+**Two modes, two strategies:**
+
+| Mode | Index during load | ID dedup mechanism |
+|---|---|---|
+| File load (`args.length > 0`) | Dropped for speed | Shared `ConcurrentHashMap` across all consumers |
+| Drain (no file) | Present | DB unique index catches rare collisions via retry |
+
+The `usedIds` field is `null` in drain mode — `generateUniqueId()` falls back to plain `idGenerator.generate()`, and the existing retry-on-1062 logic handles the ~16 collisions the DB will catch.
 
 ---
 
