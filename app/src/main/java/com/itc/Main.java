@@ -1,19 +1,16 @@
 package com.itc;
 
-import com.itc.config.DatabaseConfig;
 import com.itc.config.FlywayConfig;
 import com.itc.config.RabbitMQConfig;
 import com.itc.consumer.FileConsumer;
 import com.itc.producer.FileProducer;
+import com.itc.service.InMemoryIdRegistry;
 import com.rabbitmq.client.Channel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.ArrayList;
+import java.util.List;
 
 public class Main {
     private static final Logger log = LoggerFactory.getLogger(Main.class);
@@ -25,6 +22,13 @@ public class Main {
     public static void main(String[] args) throws Exception {
         FlywayConfig.migrate();
 
+        // Benchmark path: measure individual operation costs without needing MySQL or RabbitMQ.
+        // Usage: --benchmark
+        if (args.length >= 1 && args[0].equals("--benchmark")) {
+            new Benchmark().run();
+            return;
+        }
+
         // Bulk path: skip RabbitMQ entirely and load directly via LOAD DATA LOCAL INFILE.
         // Usage: --bulk /path/to/file.csv
         if (args.length >= 1 && args[0].equals("--bulk")) {
@@ -32,80 +36,75 @@ public class Main {
                 log.error("--bulk requires a file path: --bulk /path/to/file.csv");
                 System.exit(1);
             }
+            new Benchmark().runAutomatic();
             new BulkLoader().load(args[1]);
             return;
         }
+
+        // Benchmark always runs first so every log captures baseline performance numbers.
+        // Phase 3 (MySQL truncate) is excluded — use --benchmark alone for that.
+        new Benchmark().runAutomatic();
 
         // RabbitMQ pipeline path (default)
         try (Channel setupChannel = RabbitMQConfig.createChannel()) {
             RabbitMQConfig.declareQueues(setupChannel);
         }
 
-        boolean isFileLoad = args.length > 0;
+        // One shared registry for all consumers. H2 enforces uniqueness since MySQL
+        // no longer has a unique index on generated_id.
+        List<FileConsumer> consumers = new ArrayList<>();
+        long pipelineStart = System.currentTimeMillis();
 
-        // Shared set used only in file-load mode. The unique index is dropped during
-        // the load, so this set is the only thing preventing cross-consumer duplicates.
-        // In drain mode the index stays active and handles the rare collision via retry.
-        Set<Long> usedIds = isFileLoad ? ConcurrentHashMap.newKeySet(8_000_000) : null;
+        try (InMemoryIdRegistry registry = new InMemoryIdRegistry()) {
+            for (int i = 0; i < NUM_CONSUMERS; i++) {
+                final int id = i + 1;
+                FileConsumer consumer = new FileConsumer(registry);
+                consumers.add(consumer);
+                Thread t = new Thread(() -> {
+                    try {
+                        consumer.consume();
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                });
+                t.setName("consumer-" + id);
+                t.start();
+            }
 
-        for (int i = 0; i < NUM_CONSUMERS; i++) {
-            final int id = i + 1;
-            FileConsumer consumer = isFileLoad ? new FileConsumer(usedIds) : new FileConsumer();
-            Thread t = new Thread(() -> {
-                try {
-                    consumer.consume();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            });
-            t.setName("consumer-" + id);
-            t.start();
-        }
+            log.info("Started {} consumer threads", NUM_CONSUMERS);
 
-        log.info("Started {} consumer threads", NUM_CONSUMERS);
+            if (args.length > 0) {
+                String filePath = args[0];
+                Thread producerThread = new Thread(() -> new FileProducer().produce(filePath));
+                producerThread.setName("producer");
+                producerThread.start();
+                producerThread.join();
 
-        if (isFileLoad) {
-            String filePath = args[0];
-            dropGeneratedIdIndex();
+                log.info("Producer finished — waiting for queue to drain...");
+                waitForQueueEmpty();
 
-            Thread producerThread = new Thread(() -> new FileProducer().produce(filePath));
-            producerThread.setName("producer");
-            producerThread.start();
-            producerThread.join();
+                // Drain in-flight flushes and collect final stats
+                for (FileConsumer c : consumers) c.shutdown();
 
-            log.info("Producer finished — waiting for queue to drain...");
-            waitForQueueEmpty();
-            rebuildGeneratedIdIndex();
-        } else {
-            log.info("No file provided — consumers are draining the existing queue");
-            Thread.currentThread().join();
-        }
-    }
+                long totalMs       = System.currentTimeMillis() - pipelineStart;
+                long totalInserted = consumers.stream().mapToLong(FileConsumer::getTotalProcessed).sum();
+                long totalDupes    = consumers.stream().mapToLong(FileConsumer::getTotalDuplicates).sum();
+                long totalErrors   = consumers.stream().mapToLong(FileConsumer::getTotalErrors).sum();
+                double rate        = totalMs > 0 ? totalInserted / (totalMs / 1000.0) : 0;
 
-    private static void dropGeneratedIdIndex() throws SQLException {
-        try (Connection conn = DatabaseConfig.getConnection();
-             Statement stmt = conn.createStatement()) {
-            try {
-                stmt.execute("ALTER TABLE transactions DROP INDEX ux_generated_id");
-                log.info("Dropped ux_generated_id index for load.");
-            } catch (SQLException e) {
-                if (e.getErrorCode() == 1091) {
-                    log.info("ux_generated_id index already absent, skipping drop.");
-                } else {
-                    throw e;
-                }
+                log.info("========================================");
+                log.info("PIPELINE COMPLETE");
+                log.info("  Duration:   {}s", totalMs / 1000);
+                log.info("  Inserted:   {}", totalInserted);
+                log.info("  Duplicates: {}", totalDupes);
+                log.info("  Errors:     {}", totalErrors);
+                log.info("  Avg rate:   {}/s", String.format("%.0f", rate));
+                log.info("========================================");
+            } else {
+                log.info("No file provided — consumers are draining the existing queue");
+                Thread.currentThread().join();
             }
         }
-    }
-
-    private static void rebuildGeneratedIdIndex() throws SQLException {
-        log.info("Rebuilding ux_generated_id index...");
-        long start = System.currentTimeMillis();
-        try (Connection conn = DatabaseConfig.getConnection();
-             Statement stmt = conn.createStatement()) {
-            stmt.execute("CREATE UNIQUE INDEX ux_generated_id ON transactions(generated_id)");
-        }
-        log.info("Index rebuilt in {}ms", System.currentTimeMillis() - start);
     }
 
     private static void waitForQueueEmpty() throws Exception {

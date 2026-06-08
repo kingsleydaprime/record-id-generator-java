@@ -619,6 +619,193 @@ GROUP BY generated_id HAVING COUNT(*) > 1;
 ```
 Update those ~16 rows with fresh IDs, then create the unique index. Memory cost: zero during load.
 
+### V2: H2 In-Memory Database as the Uniqueness Registry
+
+The supervisor asked for a second version that uses an actual **in-memory database** instead of raw Java collections. This also removes the unique index on `generated_id` from MySQL entirely (V4 migration) — the in-memory DB becomes the sole uniqueness enforcer.
+
+#### What H2 is
+
+**H2** is a relational database written entirely in Java. It runs inside the same JVM as your application — no separate server process, no Docker container, no network call. You get a full SQL engine (tables, indexes, constraints, transactions) with zero infrastructure overhead.
+
+Three modes:
+
+| Mode | URL | What it means |
+|---|---|---|
+| In-memory | `jdbc:h2:mem:mydb` | Database lives in RAM; gone when the JVM exits |
+| Embedded file | `jdbc:h2:./data/mydb` | Persists to a local file, no server needed |
+| Server | `jdbc:h2:tcp://localhost/mydb` | Network server mode, like MySQL |
+
+For ID tracking we use **in-memory mode**. `DB_CLOSE_DELAY=-1` keeps the database alive for the lifetime of the JVM (without it, H2 closes the database when the last connection closes):
+
+```java
+DriverManager.getConnection("jdbc:h2:mem:id_registry;DB_CLOSE_DELAY=-1");
+```
+
+#### How It Works
+
+A single table with a `BIGINT PRIMARY KEY` is created at startup:
+
+```sql
+CREATE TABLE used_ids (id BIGINT PRIMARY KEY)
+```
+
+When a consumer wants to register an ID, it attempts an INSERT:
+- **INSERT succeeds** → ID is new, approved — `register()` returns `true`
+- **INSERT fails with duplicate key** → ID already taken — `register()` returns `false`, generate another
+
+H2 signals a duplicate key with SQLState class `"23"` (the ANSI SQL standard for integrity constraint violations):
+
+```java
+public synchronized boolean register(long id) throws SQLException {
+    insertStmt.setLong(1, id);
+    try {
+        insertStmt.executeUpdate();
+        return true;
+    } catch (SQLException e) {
+        if (e.getSQLState() != null && e.getSQLState().startsWith("23")) return false;
+        throw e;
+    }
+}
+```
+
+This is functionally identical to `ConcurrentHashMap.newKeySet().add()` — same boolean return semantics, just with SQL doing the uniqueness check. The `synchronized` prevents two threads calling `executeUpdate()` on the same `PreparedStatement` simultaneously.
+
+#### What Changed (V4 Migration + Code)
+
+**V4 migration** — drops the unique index from MySQL permanently. The DB no longer enforces uniqueness on `generated_id`. H2 is the only guard:
+
+```sql
+ALTER TABLE transactions DROP INDEX ux_generated_id;
+```
+
+**`InMemoryIdRegistry`** (new, `com.itc.service`): opens one H2 connection, creates the table, exposes `register(long id)`, implements `AutoCloseable`.
+
+**`FileConsumer`** — simplified to one constructor:
+
+```java
+// V1 — nullable field, null check, two constructors
+private final Set<Long> usedIds;       // null in drain mode
+public FileConsumer() { this.usedIds = null; }
+public FileConsumer(Set<Long> usedIds) { this.usedIds = usedIds; }
+
+// V2 — always required, one constructor, no null check
+private final InMemoryIdRegistry registry;
+public FileConsumer(InMemoryIdRegistry registry) { this.registry = registry; }
+```
+
+**`Main.java`** — cleaner:
+
+```java
+try (InMemoryIdRegistry registry = new InMemoryIdRegistry()) {
+    for (int i = 0; i < NUM_CONSUMERS; i++) {
+        new Thread(() -> new FileConsumer(registry).consume()).start();
+    }
+    // ... run producer or drain
+}
+```
+
+`dropGeneratedIdIndex()` and `rebuildGeneratedIdIndex()` are removed entirely — there is no MySQL index to manage.
+
+**`BulkLoader.java`** — `HashSet<Long>` → `InMemoryIdRegistry`, and `loadIntoDb()` becomes a single-step LOAD DATA with no drop/rebuild.
+
+#### Why B-Tree Splits Are Not a Problem in H2
+
+H2's PRIMARY KEY is also a B-tree index — so technically the same random-insert B-tree split problem that hurt MySQL exists here too. But it doesn't matter:
+
+- **RAM vs disk**: a B-tree split in H2 is pointer rearrangement in heap memory (~100ns). In MySQL InnoDB it triggers a disk write, redo log append, and possible buffer pool eviction (~1–10ms). The difference is 10,000×.
+- **Table size**: `used_ids` only stores `BIGINT` keys — no row data. The entire 5.75M-entry table fits in ~100MB of RAM. The tree is shallow, fully cache-resident, and never evicted.
+- **No durability overhead**: H2 in-memory mode has no write-ahead log, no fsync, no durable commit — a split is just a few pointer updates.
+
+H2 also supports hash indexes (`CREATE HASH INDEX`) for O(1) lookup with no B-tree at all. For this use case the standard B-tree is already fast enough.
+
+#### Alternatives Considered
+
+| Alternative | What it is | Why we didn't use it |
+|---|---|---|
+| `ConcurrentHashMap.newKeySet()` | Java hash set, thread-safe | Previous version — works, but not an actual database |
+| `HashSet<Long>` | Java hash set, single-threaded | Only works for `BulkLoader`; not thread-safe for 10 consumers |
+| **Redis** | In-memory server, `SADD` returns 0/1 | Requires a separate process; network overhead (~100μs) per check |
+| **SQLite in-memory** (`:memory:`) | C library, runs in RAM | Needs a JNI bridge (`sqlite-jdbc`); H2 is pure Java and simpler to add |
+| **Chronicle Map** | Off-heap, low GC pressure | Overkill for this scale; adds complexity |
+| **RoaringBitmap** | Compressed bitset | Only works for integer IDs within `int` range (2^32); our IDs go up to 10^12 |
+| **Bloom filter** | Probabilistic, 50× less RAM | False positives force unnecessary regeneration — harmless but messy; H2 is exact |
+| **Post-load SQL check** | No in-memory tracking at all | Zero overhead during load, but requires a post-load query + manual update pass |
+
+#### Scale Trade-Offs
+
+| | `ConcurrentHashMap` | H2 in-memory |
+|---|---|---|
+| Lookup speed | ~50–100ns (hash table) | ~5–50μs (JDBC round-trip + B-tree) |
+| Thread safety | Built-in (segment locking) | `synchronized` on the `PreparedStatement` |
+| Memory at 5.75M rows | ~275MB (boxed `Long` with node overhead) | ~100MB (raw `BIGINT`, compact B-tree pages) |
+| Memory at 50M rows | ~2.4GB | ~800MB |
+| Memory at 500M rows | `OutOfMemoryError` likely | ~8GB (may also OOM) |
+| Expresses the rule | Implicit (collection uniqueness) | Explicit (`PRIMARY KEY` constraint in SQL) |
+
+**For this project's scale**: H2 is slightly slower per check but uses less memory due to no `Long` boxing overhead. The speed difference is invisible in practice — it's swamped by MySQL write time and network latency.
+
+**At very large scale (100M+ rows)**: both approaches strain JVM heap. At that point, use off-heap options (Chronicle Map, Redis) or the post-load SQL check approach (zero memory cost during load).
+
+**Architectural benefit of H2**: uniqueness is expressed as a SQL constraint — explicit, self-documenting, and enforced by a database engine rather than implicit collection behaviour.
+
+#### What If H2 Stored the Full Rows? The Windowed Staging Buffer
+
+A natural extension of the V2 idea: instead of writing each batch directly to MySQL, what if H2 also held the full transaction rows — then you push them to MySQL in bulk windows?
+
+```
+RabbitMQ → parse + generate ID → INSERT full row into H2
+                                        ↓  (every 500k rows)
+                                  bulk export H2 → MySQL
+                                  clear H2 staging rows
+                                        ↑  (continue)
+```
+
+**Memory stays bounded**: 500k rows × ~700 bytes ≈ 350MB per window, regardless of total file size. The window size is tunable.
+
+**The durability problem — when do you ack?**
+
+This is the fundamental tension the pattern creates:
+
+| Ack timing | What happens on JVM crash | Problem |
+|---|---|---|
+| Ack as messages arrive | Messages gone from RabbitMQ; not yet in MySQL | Silent data loss |
+| Ack only after MySQL flush | 500k messages stay unacked the whole window | `basicQos` must be 500k; crash redelivers the whole window |
+
+Neither is clean. The current approach (ack after each MySQL batch commit) gives you at-most-one-batch-lost on crash. Windowed staging either loses the whole window or holds 500k unacked messages in RabbitMQ.
+
+**The cross-batch uniqueness problem**
+
+When you clear H2's row data after each flush, you also lose the ID history. Batch 2 could generate an ID that batch 1 already inserted into MySQL. Fix: split H2 into two tables with different lifecycles:
+
+```sql
+-- Never cleared — tracks IDs for the entire run (~100MB total)
+CREATE TABLE used_ids (id BIGINT PRIMARY KEY)
+
+-- Cleared after every flush — holds full rows for the current window (~350MB)
+CREATE TABLE staging (generated_id VARCHAR(12), payment_type_id VARCHAR(50), ...)
+```
+
+The `used_ids` table grows for the whole run. The `staging` table is `TRUNCATE`d after each window push.
+
+**When windowed staging wins**
+
+The extra complexity pays off when rows need in-memory processing that is easier in SQL than in Java:
+
+- **Deduplication across rows in the same window** — `SELECT source_trans_id, COUNT(*) GROUP BY ... HAVING COUNT(*) > 1` in H2 before pushing
+- **Joins or lookups against reference data** — load a lookup table into H2 at startup, join against it during processing
+- **Aggregations before write** — sum by merchant, validate totals, then write the enriched rows
+
+For straight insert-and-move-on (what this project does), the windowed staging approach adds complexity without clear performance gain over the existing bulk path.
+
+**Comparison**
+
+| Approach | Memory ceiling | Durability on crash | MySQL write pattern | Complexity |
+|---|---|---|---|---|
+| Current RabbitMQ (50k batches) | Low (one batch in RAM) | Lose one in-flight batch | Many small committed batches | Low |
+| `--bulk` (LOAD DATA) | Medium (temp CSV on disk) | Lose the whole run | One giant LOAD DATA | Medium |
+| Windowed H2 staging (500k window) | Medium (one window in RAM) | Lose one window | Several medium bulk loads | High |
+| Full H2 staging (all rows) | ~4–5GB for 5.75M rows | Lose everything | One flush at end | Extreme |
+
 ---
 
 ## 12. CSV Parsing at Scale
@@ -3377,6 +3564,42 @@ The `usedIds` field is `null` in drain mode — `generateUniqueId()` falls back 
 
 ---
 
+### V2: H2 Registry Replaces the Shared ConcurrentHashMap
+
+In V2, the `ConcurrentHashMap.newKeySet()` and the two-constructor pattern were replaced with a single `InMemoryIdRegistry` backed by H2. The contract is the same — one shared registry, all consumers see the same state — but the backing store is a real SQL database instead of a Java collection.
+
+The two-mode split (drain mode / file-load mode) disappears entirely because the V4 migration removed the MySQL unique index permanently. There is now only one mode: the H2 registry is always the uniqueness guard, regardless of whether a file was passed or not.
+
+```java
+// V1 — two constructors, null check in generateUniqueId()
+private final Set<Long> usedIds;
+public FileConsumer() { this.usedIds = null; }
+public FileConsumer(Set<Long> usedIds) { this.usedIds = usedIds; }
+
+private String generateUniqueId() {
+    if (usedIds == null) return idGenerator.generate();   // drain mode: rely on DB index
+    String id = idGenerator.generate();
+    while (!usedIds.add(Long.parseLong(id))) { id = idGenerator.generate(); }
+    return id;
+}
+
+// V2 — one constructor, registry always required, no null path
+private final InMemoryIdRegistry registry;
+public FileConsumer(InMemoryIdRegistry registry) { this.registry = registry; }
+
+private String generateUniqueId() throws SQLException {
+    String id = idGenerator.generate();
+    while (!registry.register(Long.parseLong(id))) { id = idGenerator.generate(); }
+    return id;
+}
+```
+
+`Main.java` also simplifies: there is no `isFileLoad` branch for the registry, no `dropGeneratedIdIndex()`, and no `rebuildGeneratedIdIndex()` — those three methods are gone because the MySQL index no longer exists.
+
+See Section 11 "V2: H2 In-Memory Database as the Uniqueness Registry" for a full explanation of what H2 is, why B-tree splits are not a problem in-memory, alternative options considered, and scale trade-offs.
+
+---
+
 ### This Is Why the Architecture Uses RabbitMQ
 
 Direct CSV-to-MySQL (without a queue) can only use one writer at a time per file — you'd need to split the file manually to parallelise. With RabbitMQ, the queue automatically distributes work to however many consumers you add, on however many machines you have. Adding a new consumer is just starting a new process — no file splitting, no coordination, no code change.
@@ -3879,6 +4102,15 @@ The table below is a condensed record of what changed, why, and what you would l
 | `declareQueues` moved to `Main.java` | `Main.java` / `FileConsumer.java` | 10 threads simultaneously declaring the same queue caused a silent deadlock | `try (Channel setup = ...) { declareQueues(setup); }` before consumer loop |
 | `splitCsv()` replaces `split(",")` | `FileConsumer.java` | Quoted fields containing commas shifted all column indices | `splitCsv(line)` in `parseLine()` |
 | Shovel plugin for DLQ replay | RabbitMQ container | Move failed messages back to main queue after fixing the bug | `docker exec <container> rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management` |
+| **V2 — H2 in-memory registry** | | | |
+| V4 migration — drop `ux_generated_id` from MySQL | `V4__drop_generated_id_index.sql` | MySQL no longer enforces uniqueness; H2 is the sole guard | `ALTER TABLE transactions DROP INDEX ux_generated_id` |
+| H2 dependency | `build.gradle.kts` | New dep for in-memory DB | `implementation("com.h2database:h2:2.2.224")` |
+| `InMemoryIdRegistry` service | `InMemoryIdRegistry.java` (new) | Replaces `ConcurrentHashMap` / `HashSet` — SQL uniqueness via H2 | `CREATE TABLE used_ids (id BIGINT PRIMARY KEY)` + `register(long id)` |
+| `FileConsumer` — single constructor | `FileConsumer.java` | Drain mode / file-load split removed; registry always required | `FileConsumer(InMemoryIdRegistry registry)` only |
+| `generateUniqueId()` — calls `registry.register()` | `FileConsumer.java` | Replaces `usedIds.add()`; no null check, no two-path logic | `while (!registry.register(Long.parseLong(id)))` |
+| `BulkLoader` — `HashSet<Long>` → `InMemoryIdRegistry` | `BulkLoader.java` | Consistent approach across all paths | `registry.register(...)` in pre-process loop |
+| `BulkLoader.loadIntoDb()` — drop/rebuild steps removed | `BulkLoader.java` | MySQL index gone; LOAD DATA is now one step | Step 2/2 instead of steps 2/3 + 3/3 |
+| `Main.java` — `dropGeneratedIdIndex` / `rebuildGeneratedIdIndex` deleted | `Main.java` | No MySQL index to manage | `try (InMemoryIdRegistry registry = new InMemoryIdRegistry())` wraps the run |
 
 ---
 

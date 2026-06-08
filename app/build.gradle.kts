@@ -33,6 +33,9 @@ dependencies {
     implementation("org.flywaydb:flyway-core:10.15.0")
     implementation("org.flywaydb:flyway-mysql:10.15.0")
 
+    // H2 in-memory database for cross-consumer ID uniqueness tracking
+    implementation("com.h2database:h2:2.2.224")
+
     // Lombok for reducing boilerplate code
     compileOnly("org.projectlombok:lombok:1.18.32")
     annotationProcessor("org.projectlombok:lombok:1.18.32")

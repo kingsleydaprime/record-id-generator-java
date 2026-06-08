@@ -2,14 +2,13 @@ package com.itc;
 
 import com.itc.config.DatabaseConfig;
 import com.itc.service.IdGeneratorService;
+import com.itc.service.InMemoryIdRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.file.*;
 import java.sql.*;
-import java.util.HashSet;
-import java.util.Set;
 
 public class BulkLoader {
     private static final Logger log = LoggerFactory.getLogger(BulkLoader.class);
@@ -19,8 +18,8 @@ public class BulkLoader {
     public void load(String csvPath) throws Exception {
         log.info("Bulk load starting: {}", csvPath);
         Path tempFile = Files.createTempFile("bulk_load_", ".csv");
-        try {
-            long rows = preProcess(csvPath, tempFile);
+        try (InMemoryIdRegistry registry = new InMemoryIdRegistry()) {
+            long rows = preProcess(csvPath, tempFile, registry);
             loadIntoDb(tempFile, rows);
         } finally {
             Files.deleteIfExists(tempFile);
@@ -28,14 +27,11 @@ public class BulkLoader {
         }
     }
 
-    private long preProcess(String csvPath, Path tempFile) throws IOException {
+    private long preProcess(String csvPath, Path tempFile, InMemoryIdRegistry registry) throws IOException, SQLException {
         log.info("Step 1/2 — pre-processing: assigning IDs, writing temp file...");
         long rows = 0;
         long collisions = 0;
         long start = System.currentTimeMillis();
-
-        // Store used IDs as longs to avoid String overhead (~46MB vs ~460MB for String set)
-        Set<Long> usedIds = new HashSet<>(8_000_000);
 
         try (BufferedReader reader = Files.newBufferedReader(Path.of(csvPath));
              BufferedWriter writer = Files.newBufferedWriter(tempFile)) {
@@ -46,10 +42,8 @@ public class BulkLoader {
             while ((line = reader.readLine()) != null) {
                 if (line.isBlank()) continue;
 
-                // Generate a unique ID — collisions are ~16 across 5.75M rows so this
-                // loop almost never iterates more than once.
                 String id = idGenerator.generate();
-                while (!usedIds.add(Long.parseLong(id))) {
+                while (!registry.register(Long.parseLong(id))) {
                     collisions++;
                     id = idGenerator.generate();
                 }
@@ -89,12 +83,7 @@ public class BulkLoader {
         try (Connection conn = DatabaseConfig.getConnection();
              Statement stmt = conn.createStatement()) {
 
-            // Drop the unique index so the load is pure sequential writes — no per-row
-            // B-tree maintenance means no page splits and no slowdown as the table grows.
-            log.info("Step 2/3 — dropping index for load...");
-            stmt.execute("ALTER TABLE transactions DROP INDEX ux_generated_id");
-
-            log.info("Step 3/3 — loading {} rows via LOAD DATA LOCAL INFILE...", expectedRows);
+            log.info("Step 2/2 — loading {} rows via LOAD DATA LOCAL INFILE...", expectedRows);
             long loadStart = System.currentTimeMillis();
             stmt.execute(loadSql);
 
@@ -107,13 +96,6 @@ public class BulkLoader {
             log.info("Load done: {}/{} rows in {}ms ({}/s)",
                     loaded, expectedRows, loadMs,
                     String.format("%.0f", loaded / (loadMs / 1000.0)));
-
-            // Rebuild the index in one bulk sort pass — orders of magnitude faster than
-            // maintaining it per-row during the load.
-            log.info("Rebuilding ux_generated_id index...");
-            long indexStart = System.currentTimeMillis();
-            stmt.execute("CREATE UNIQUE INDEX ux_generated_id ON transactions(generated_id)");
-            log.info("Index built in {}ms", System.currentTimeMillis() - indexStart);
 
             if (loaded < expectedRows) {
                 log.warn("{} rows were skipped — check for constraint violations.",
