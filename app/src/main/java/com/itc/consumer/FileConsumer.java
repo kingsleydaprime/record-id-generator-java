@@ -5,6 +5,7 @@ import com.itc.model.Log;
 import com.itc.model.Transaction;
 import com.itc.repository.LogRepository;
 import com.itc.repository.TransactionRepository;
+import com.itc.service.FeeCalculator;
 import com.itc.service.IdGeneratorService;
 import com.itc.service.InMemoryIdRegistry;
 import com.rabbitmq.client.*;
@@ -28,6 +29,7 @@ public class FileConsumer {
     private final TransactionRepository transactionRepository = new TransactionRepository();
     private final LogRepository logRepository = new LogRepository();
     private final IdGeneratorService idGenerator = new IdGeneratorService();
+    private final FeeCalculator feeCalculator = new FeeCalculator();
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final int BATCH_SIZE = 50_000;
     private static final Logger log = LoggerFactory.getLogger(FileConsumer.class);
@@ -44,6 +46,9 @@ public class FileConsumer {
     private volatile long totalProcessed = 0;
     private volatile long totalDuplicates = 0;
     private volatile long totalErrors = 0;
+    private volatile long totalIdGenNs = 0;
+    private volatile long totalDbMs = 0;
+    private volatile long totalBatches = 0;
     private final long startTime = System.currentTimeMillis();
 
     public FileConsumer(InMemoryIdRegistry registry) {
@@ -60,6 +65,9 @@ public class FileConsumer {
     public long getTotalProcessed()  { return totalProcessed; }
     public long getTotalDuplicates() { return totalDuplicates; }
     public long getTotalErrors()     { return totalErrors; }
+    public long getTotalIdGenNs()    { return totalIdGenNs; }
+    public long getTotalDbMs()       { return totalDbMs; }
+    public long getTotalBatches()    { return totalBatches; }
 
     private String generateUniqueId() throws SQLException {
         String id = idGenerator.generate();
@@ -81,7 +89,10 @@ public class FileConsumer {
             String line = new String(delivery.getBody());
             try {
                 Transaction transaction = parseLine(line);
+                long idStart = System.nanoTime();
                 transaction.setGeneratedId(generateUniqueId());
+                totalIdGenNs += System.nanoTime() - idStart;
+                feeCalculator.calculate(transaction);
 
                 List<Transaction> batchSnapshot = null;
                 List<String> linesSnapshot = null;
@@ -172,6 +183,8 @@ public class FileConsumer {
         long batchMs = System.currentTimeMillis() - batchStart;
         totalProcessed += batch.size() - skipped;
         totalDuplicates += skipped;
+        totalDbMs += dbMs;
+        totalBatches++;
 
         logStats(batch.size(), skipped, batchMs, dbMs);
         channel.basicAck(deliveryTags.get(deliveryTags.size() - 1), true);

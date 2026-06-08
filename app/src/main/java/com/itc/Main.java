@@ -22,9 +22,16 @@ public class Main {
     public static void main(String[] args) throws Exception {
         FlywayConfig.migrate();
 
-        // Benchmark path: measure individual operation costs without needing MySQL or RabbitMQ.
+        // Safe benchmark — phases 1, 2, 4. No truncation. Safe to run anywhere.
         // Usage: --benchmark
         if (args.length >= 1 && args[0].equals("--benchmark")) {
+            new Benchmark().runAutomatic();
+            return;
+        }
+
+        // Full benchmark — all 4 phases including MySQL truncation test. Dev only.
+        // Usage: --benchmark-full
+        if (args.length >= 1 && args[0].equals("--benchmark-full")) {
             new Benchmark().run();
             return;
         }
@@ -42,8 +49,12 @@ public class Main {
         }
 
         // Benchmark always runs first so every log captures baseline performance numbers.
-        // Phase 3 (MySQL truncate) is excluded — use --benchmark alone for that.
+        // Phase 3 (MySQL truncate) is excluded — use --benchmark-full for that.
         new Benchmark().runAutomatic();
+
+        log.info("=".repeat(74));
+        log.info("Benchmarks done — starting pipeline...");
+        log.info("=".repeat(74));
 
         // RabbitMQ pipeline path (default)
         try (Channel setupChannel = RabbitMQConfig.createChannel()) {
@@ -80,26 +91,40 @@ public class Main {
                 producerThread.start();
                 producerThread.join();
 
-                log.info("Producer finished — waiting for queue to drain...");
+                long producerMs = System.currentTimeMillis() - pipelineStart;
+                log.info("Producer finished in {}s — waiting for queue to drain...", producerMs / 1000);
                 waitForQueueEmpty();
 
                 // Drain in-flight flushes and collect final stats
                 for (FileConsumer c : consumers) c.shutdown();
 
                 long totalMs       = System.currentTimeMillis() - pipelineStart;
+                long consumerMs    = totalMs - producerMs;
                 long totalInserted = consumers.stream().mapToLong(FileConsumer::getTotalProcessed).sum();
                 long totalDupes    = consumers.stream().mapToLong(FileConsumer::getTotalDuplicates).sum();
                 long totalErrors   = consumers.stream().mapToLong(FileConsumer::getTotalErrors).sum();
+                long totalIdGenNs  = consumers.stream().mapToLong(FileConsumer::getTotalIdGenNs).sum();
+                long totalDbMs2    = consumers.stream().mapToLong(FileConsumer::getTotalDbMs).sum();
+                long totalBatches  = consumers.stream().mapToLong(FileConsumer::getTotalBatches).sum();
                 double rate        = totalMs > 0 ? totalInserted / (totalMs / 1000.0) : 0;
+                double avgIdGenUs  = totalInserted > 0 ? (totalIdGenNs / (double) totalInserted) / 1_000.0 : 0;
+                double avgBatchMs  = totalBatches > 0 ? totalDbMs2 / (double) totalBatches : 0;
+                double mysqlRate   = totalDbMs2 > 0 ? totalInserted / (totalDbMs2 / 1000.0) : 0;
 
                 log.info("========================================");
                 log.info("PIPELINE COMPLETE");
-                log.info("  Duration:   {}s", totalMs / 1000);
-                log.info("  Inserted:   {}", totalInserted);
-                log.info("  Duplicates: {}", totalDupes);
-                log.info("  Errors:     {}", totalErrors);
-                log.info("  Avg rate:   {}/s", String.format("%.0f", rate));
+                log.info("  Publish to queue:   {}s", producerMs / 1000);
+                log.info("  Consumer lag:       {}s  (queue drain time after producer finished)", consumerMs / 1000);
+                log.info("  Total (end-to-end): {}s", totalMs / 1000);
+                log.info("  Inserted:           {}", totalInserted);
+                log.info("  Duplicates:         {}", totalDupes);
+                log.info("  Errors:             {}", totalErrors);
+                log.info("  Avg rate:           {}/s  (end-to-end)", String.format("%.0f", rate));
+                log.info("  Avg ID gen:         {}µs/id", String.format("%.2f", avgIdGenUs));
+                log.info("  MySQL avg batch:    {}ms/batch  ({} batches)", String.format("%.0f", avgBatchMs), totalBatches);
+                log.info("  MySQL throughput:   {}/s  (pure insert time)", String.format("%.0f", mysqlRate));
                 log.info("========================================");
+                System.exit(0);
             } else {
                 log.info("No file provided — consumers are draining the existing queue");
                 Thread.currentThread().join();

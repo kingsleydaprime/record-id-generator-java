@@ -16,8 +16,9 @@ public class TransactionRepository {
                     generated_id, payment_type_id, source_id, thirdparty_id, source_date_created,
                     source_account_no, source_trans_id, channel_id, terminal_id, merchant_id,
                     product_id, sub_merchant_id, accountref, accountname, paymentmsisdn,
-                    narration, currency, amount, fees, year, processor, country, transtype, month
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    narration, currency, amount, fees, network_fee, itc_fee,
+                    year, processor, country, transtype, month
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """;
 
         try (Connection conn = DatabaseConfig.getConnection();
@@ -34,8 +35,9 @@ public class TransactionRepository {
                     generated_id, payment_type_id, source_id, thirdparty_id, source_date_created,
                     source_account_no, source_trans_id, channel_id, terminal_id, merchant_id,
                     product_id, sub_merchant_id, accountref, accountname, paymentmsisdn,
-                    narration, currency, amount, fees, year, processor, country, transtype, month
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    narration, currency, amount, fees, network_fee, itc_fee,
+                    year, processor, country, transtype, month
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """;
 
         try (Connection conn = DatabaseConfig.getConnection();
@@ -92,11 +94,13 @@ public class TransactionRepository {
         stmt.setString(17, t.getCurrency());
         stmt.setBigDecimal(18, t.getAmount());
         stmt.setBigDecimal(19, t.getFees());
-        stmt.setInt(20, t.getYear());
-        stmt.setString(21, t.getProcessor());
-        stmt.setString(22, t.getCountry());
-        stmt.setString(23, t.getTranstype());
-        stmt.setString(24, t.getMonth());
+        stmt.setBigDecimal(20, t.getNetworkFee());
+        stmt.setBigDecimal(21, t.getItcFee());
+        stmt.setInt(22, t.getYear());
+        stmt.setString(23, t.getProcessor());
+        stmt.setString(24, t.getCountry());
+        stmt.setString(25, t.getTranstype());
+        stmt.setString(26, t.getMonth());
     }
 
 }

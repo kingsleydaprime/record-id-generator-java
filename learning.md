@@ -4082,6 +4082,377 @@ Java has two kinds of threads:
 
 ---
 
+## 45. Fee Splitting — Encoding Business Rules in a Service
+
+When a raw fee column in the source data is actually a combined figure (network fee + ITC fee), you need to split it based on business rules that come from outside the data itself. This is a pure business logic problem, and the right place for it is a dedicated service class — not a repository, not a consumer callback, not inline code.
+
+### The Business Rule
+
+For **inflow** transactions only:
+- Look up the network's share rate based on `source_id`
+- `network_fee = amount × rate`
+- `itc_fee = fees − network_fee` (can be negative — ITC absorbs the loss)
+
+For **outflow** transactions: fee split does not apply — store `NULL`.
+
+Rate table:
+
+| source_id | Rate |
+|---|---|
+| MTN | 0.75% |
+| AIRTEL | 1.0% |
+| TELECEL | 1.3% |
+| anything else | 1.0% |
+
+### The FeeCalculator Service
+
+```java
+public class FeeCalculator {
+
+    private static final BigDecimal RATE_MTN     = new BigDecimal("0.0075");
+    private static final BigDecimal RATE_AIRTEL  = new BigDecimal("0.01");
+    private static final BigDecimal RATE_TELECEL = new BigDecimal("0.013");
+    private static final BigDecimal RATE_DEFAULT = new BigDecimal("0.01");
+
+    public void calculate(Transaction t) {
+        if (!"inflow".equalsIgnoreCase(t.getTranstype())) {
+            t.setNetworkFee(null);
+            t.setItcFee(null);
+            return;
+        }
+
+        BigDecimal rate       = rateFor(t.getSourceId());
+        BigDecimal networkFee = t.getAmount().multiply(rate).setScale(6, RoundingMode.HALF_UP);
+        BigDecimal itcFee     = t.getFees().subtract(networkFee).setScale(6, RoundingMode.HALF_UP);
+
+        t.setNetworkFee(networkFee);
+        t.setItcFee(itcFee);
+    }
+
+    private BigDecimal rateFor(String sourceId) {
+        if (sourceId == null) return RATE_DEFAULT;
+        switch (sourceId.trim().toUpperCase()) {
+            case "MTN":     return RATE_MTN;
+            case "AIRTEL":  return RATE_AIRTEL;
+            case "TELECEL": return RATE_TELECEL;
+            default:        return RATE_DEFAULT;
+        }
+    }
+}
+```
+
+Each rate is a `static final BigDecimal` constant — created once, reused for every row. Never construct `new BigDecimal("0.0075")` inside the method; that allocates a new object on every call and matters at 5 million rows.
+
+### Why null, not 0, for Outflows
+
+`null` and `0` mean different things in a database:
+
+| Value | Meaning |
+|---|---|
+| `0` | Calculated, and the answer is zero |
+| `NULL` | Not applicable — the concept does not apply to this row |
+
+For outflows, a network fee isn't zero — it doesn't exist. Storing `0` would make it impossible to distinguish "inflow where the network fee was actually zero" from "outflow where the column doesn't apply". `NULL` is the correct semantic.
+
+In Java, `stmt.setBigDecimal(n, null)` stores `NULL` in a `DECIMAL` column. The column must be declared `NULL` in the schema (not `NOT NULL`).
+
+### DECIMAL(18,6) — Why More Decimal Places for Fee Columns
+
+`amount` and `fees` are `DECIMAL(18,2)` — two decimal places, matching currency precision.
+
+When you multiply a `DECIMAL(18,2)` amount by a rate like `0.0075` (4 decimal places), the result can have up to `2 + 4 = 6` decimal places:
+
+```
+100.00 × 0.0075 = 0.750000  ← 6 decimal places
+```
+
+Storing this in a `DECIMAL(18,2)` column would truncate it to `0.75` — fine for this example, but rounding fees before storing them can compound across millions of rows. `DECIMAL(18,6)` preserves the full precision of the multiplication result.
+
+### RoundingMode.HALF_UP — Controlling the Rounding
+
+`BigDecimal.multiply()` returns a result with the combined scale of both operands (2 + 4 = 6 here). Calling `.setScale(6, RoundingMode.HALF_UP)` is explicit about what happens if the scale is already correct (nothing) or needs rounding (round the last digit up at 0.5).
+
+`HALF_UP` matches everyday financial rounding (0.5 rounds up). Other modes exist (`HALF_EVEN` for banker's rounding, `FLOOR` for always rounding down) — pick one and be consistent. Mixing rounding modes across a pipeline produces inconsistent results that are hard to audit.
+
+### Negative itc_fee — ITC Lost Money
+
+If `fees < network_fee`, `itc_fee` is negative. This is valid and intentional — it means the transaction was priced too cheaply and ITC absorbed the difference. Store it as-is. Clamping to zero would hide the loss and distort any profitability analysis.
+
+### Where the Calculation Lives in the Flow
+
+```
+RabbitMQ message arrives
+    → parseLine() — builds the Transaction from CSV fields
+    → generateUniqueId() — assigns generated_id
+    → feeCalculator.calculate(t) — sets network_fee and itc_fee   ← new step
+    → batch.add(t) — enters the batch buffer
+    → flushBatch() → saveBatch() → MySQL INSERT
+```
+
+The calculator is called after parsing, before batching. It's a pure in-memory operation — no DB, no I/O — so it adds negligible time per row.
+
+---
+
+## 46. volatile — Making Values Visible Across Threads
+
+The Java Memory Model allows each thread to maintain its own **local cache** of variables from main memory. This is an optimisation — reading from cache is faster than main memory. The consequence is that a value written by one thread may not be immediately visible to another thread reading the same variable.
+
+### The Problem in This Project
+
+`FileConsumer` tracks three counters:
+
+```java
+private long totalProcessed = 0;
+private long totalDuplicates = 0;
+private long totalErrors = 0;
+```
+
+`totalProcessed` and `totalDuplicates` are updated inside `flushBatch()`, which runs on the `flushExecutor` thread. `totalErrors` is updated inside the RabbitMQ callback thread. `Main.java` reads all three after `shutdown()` completes (on the main thread).
+
+Without any synchronisation, the main thread's cache of these variables might be stale — it could read `totalProcessed = 0` even though the flush thread wrote `575620` to it. In practice this rarely causes a bug (the `awaitTermination()` call often flushes the CPU cache anyway), but it is a data race and undefined behaviour under the Java Memory Model.
+
+### The Fix — volatile
+
+```java
+private volatile long totalProcessed = 0;
+private volatile long totalDuplicates = 0;
+private volatile long totalErrors = 0;
+```
+
+`volatile` gives two guarantees:
+1. **Visibility** — every write is immediately flushed to main memory; every read goes directly to main memory (never the local cache)
+2. **Ordering** — writes and reads cannot be reordered across the `volatile` access by the compiler or CPU
+
+`volatile` does **not** give atomicity. `totalProcessed += batch.size()` is a read-modify-write. If two threads executed that line simultaneously, the result could be wrong. But in this code, only the `flushExecutor` thread writes to `totalProcessed` (the consumer threads never increment it directly). Single writer + single reader after shutdown = `volatile` is sufficient.
+
+### When to Use What
+
+| Situation | Tool |
+|---|---|
+| One thread writes, others only read | `volatile` |
+| Multiple threads increment a counter | `AtomicLong.incrementAndGet()` |
+| Multiple threads do compound operations (read-then-update) | `synchronized` block |
+| Complex multi-step operations with rollback | `Lock` / `synchronized` |
+
+For the observer counters here: one writer (flush thread), one reader (main thread reads after the writer is done). `volatile` is the right choice — no locking overhead, no boxing, no CAS loop.
+
+---
+
+## 47. Clean Shutdown — Draining Executors, Collecting Stats, and Exiting
+
+### The Problem
+
+After `waitForQueueEmpty()` in `Main.java`:
+
+- The RabbitMQ queue shows zero ready messages
+- But `FileConsumer` may still have in-flight flushes running on `flushExecutor`
+- The `scheduler` is still running (fires every 10 seconds)
+- `flushExecutor` and `scheduler` are non-daemon `ExecutorService` threads — the JVM stays alive as long as they run
+
+This means two things are broken after the queue drains:
+1. **The pipeline never exits** — the JVM hangs waiting for threads that are no longer doing useful work
+2. **Stats are unreliable** — reading `getTotalProcessed()` before the last flush completes gives a low number
+
+### The Fix — shutdown() + awaitTermination()
+
+A `shutdown()` method on `FileConsumer` tells both executors to stop accepting new tasks, then waits for their in-flight work to finish:
+
+```java
+public void shutdown() throws InterruptedException {
+    scheduler.shutdown();
+    scheduler.awaitTermination(30, TimeUnit.SECONDS);  // wait for last timed flush
+
+    flushExecutor.shutdown();
+    flushExecutor.awaitTermination(60, TimeUnit.SECONDS);  // wait for last MySQL insert
+}
+```
+
+`shutdown()` vs `shutdownNow()`:
+- `shutdown()` — graceful: finish the current task, reject new ones
+- `shutdownNow()` — forceful: interrupt the current task immediately
+
+Always use `shutdown()` for a data pipeline. Interrupting a MySQL batch insert mid-commit leaves partial data.
+
+`awaitTermination(n, unit)` blocks the calling thread until either the executor finishes all tasks or the timeout expires. The scheduler gets 30 seconds (enough for one more timed flush cycle). The flush executor gets 60 seconds (enough for the largest MySQL batch insert to complete).
+
+### Collecting Stats After Drain
+
+After `consumer.shutdown()` returns, all flush threads have completed their final writes. The `volatile` counters are now safe to read from the main thread:
+
+```java
+for (FileConsumer c : consumers) c.shutdown();  // waits for all flushing to complete
+
+long totalInserted = consumers.stream().mapToLong(FileConsumer::getTotalProcessed).sum();
+long totalDupes    = consumers.stream().mapToLong(FileConsumer::getTotalDuplicates).sum();
+long totalErrors   = consumers.stream().mapToLong(FileConsumer::getTotalErrors).sum();
+```
+
+`consumers.stream().mapToLong(...).sum()` aggregates one counter across all `NUM_CONSUMERS` consumer instances. Each consumer tracked its own rows independently — the sum gives the pipeline total.
+
+### Natural Exit vs System.exit(0)
+
+After `shutdown()` drains the executors, the JVM has no remaining non-daemon threads. `main()` returns, and the JVM exits on its own — no `System.exit(0)` needed.
+
+`System.exit(0)` would also work, but it skips JVM shutdown hooks (registered via `Runtime.getRuntime().addShutdownHook(...)`). Natural exit lets hooks run — useful if you ever add cleanup hooks (e.g. flushing metrics, closing a connection pool).
+
+### What the Final Log Looks Like
+
+```
+[main] Main - Queue empty — waiting 30s for in-flight flushes to commit...
+[main] Main - ========================================
+[main] Main - PIPELINE COMPLETE
+[main] Main -   Duration:   638s
+[main] Main -   Inserted:   575620
+[main] Main -   Duplicates: 0
+[main] Main -   Errors:     0
+[main] Main -   Avg rate:   902/s
+[main] Main - ========================================
+```
+
+After the last line, the process exits. No Ctrl+C.
+
+---
+
+## 48. H2 Instance Isolation — The DB_CLOSE_DELAY Bug
+
+This section covers a bug discovered when the auto-benchmark ran `benchmarkH2Registry()`, which creates two `InMemoryIdRegistry` instances sequentially.
+
+### The Bug
+
+```
+Exception in thread "main" org.h2.jdbc.JdbcSQLSyntaxErrorException: 
+Table "USED_IDS" already exists
+    at com.itc.service.InMemoryIdRegistry.<init>(InMemoryIdRegistry.java:18)
+```
+
+The original `InMemoryIdRegistry` constructor used:
+
+```java
+conn = DriverManager.getConnection("jdbc:h2:mem:id_registry;DB_CLOSE_DELAY=-1");
+stmt.execute("CREATE TABLE used_ids (id BIGINT PRIMARY KEY)");
+```
+
+`DB_CLOSE_DELAY=-1` tells H2: *keep this database alive even after all connections close, for the lifetime of the JVM*. The named database `id_registry` is a singleton for the whole JVM.
+
+When the benchmark's `close()` was called on the first `InMemoryIdRegistry`:
+
+```java
+insertStmt.close();
+conn.close();   // closes the CONNECTION — not the database
+```
+
+The connection was closed, but the database (`id_registry`) stayed alive because of `DB_CLOSE_DELAY=-1`. The `used_ids` table still existed. When the second `new InMemoryIdRegistry()` ran `CREATE TABLE used_ids`, H2 threw "table already exists".
+
+### The Fix — Unique Database Name Per Instance
+
+```java
+String dbName = "id_registry_" + System.nanoTime();
+conn = DriverManager.getConnection("jdbc:h2:mem:" + dbName);
+```
+
+Each `InMemoryIdRegistry` instance gets its own H2 database with a unique name. No two instances ever share a database. `DB_CLOSE_DELAY` is removed — without it, H2 closes the in-memory database when the last connection to it closes. Since `InMemoryIdRegistry` holds the only connection, the database lives exactly as long as the instance does.
+
+### The General Lesson
+
+`DB_CLOSE_DELAY=-1` turns an H2 in-memory database into a JVM-scoped singleton. This is useful when multiple parts of the code open separate connections to the *same* database and you don't want it to disappear between accesses. But it's a trap when you expect separate instances to have separate databases — they don't, because they all connect to the same named database.
+
+The safer default for an encapsulated resource (one owner, one connection, one lifetime): use a unique name and let H2 manage the lifecycle naturally.
+
+| | Named DB + DB_CLOSE_DELAY=-1 | Unique name, no delay |
+|---|---|---|
+| Database lifetime | JVM lifetime | Connection lifetime |
+| Multiple instances share state? | Yes | No |
+| Table persists after close()? | Yes — bug source | No — cleaned up automatically |
+| Use when | Multiple owners, same DB | One owner per instance |
+
+---
+
+## 49. Live Metrics vs Synthetic Benchmarks
+
+A synthetic benchmark creates a controlled test — fixed data, empty table, isolated from real workload. Useful for measuring one variable at a time. The Phase 3 MySQL test was synthetic: truncate, insert 100k rows, measure, repeat at different batch sizes.
+
+The problem with synthetic benchmarks for a data pipeline is that they don't reflect real conditions:
+- Empty table → B-tree is shallow and fully in buffer pool
+- No concurrent consumers → no lock contention
+- Synthetic rows → different size and distribution than real data
+- Separate run → MySQL is cold, not warmed by a preceding workload
+
+**Live metrics** collect the same measurements during the actual pipeline run. Every `flushBatch()` call already times the MySQL insert (`dbMs`). Accumulating those timings across all batches gives you:
+- Average batch insert time under real concurrency
+- MySQL throughput calculated from pure insert time (excluding queue, parsing, H2)
+- Variance you can see in the per-batch logs (`[db=Xms other=Xms]`)
+
+For a production pipeline the live metrics are strictly better — they measure what you actually care about: how fast MySQL inserts under your real load. The synthetic benchmark was only needed because there was no other way to get MySQL numbers. Once the pipeline runs, there is.
+
+### What Was Tracked
+
+Three counters added to `FileConsumer`, accumulated in `flushBatch()`:
+
+```java
+private volatile long totalDbMs    = 0;  // total milliseconds spent in saveBatch()
+private volatile long totalBatches = 0;  // number of flushes completed
+```
+
+In the summary:
+```java
+double avgBatchMs = totalBatches > 0 ? totalDbMs / (double) totalBatches : 0;
+double mysqlRate  = totalDbMs  > 0 ? totalInserted / (totalDbMs / 1000.0) : 0;
+```
+
+`mysqlRate` divides total rows by *pure MySQL time only* — it excludes queue delivery, parsing, ID generation, H2 registration, and scheduling. This is MySQL's raw throughput under your load. Compare it to the end-to-end `rate` to see how much time the rest of the pipeline adds.
+
+### Reading the Bottleneck
+
+```
+Avg rate:          7986/s   ← end-to-end (includes everything)
+MySQL throughput:  22000/s  ← pure insert time only
+```
+
+MySQL throughput (22k/s) is nearly 3× the end-to-end rate (8k/s). This means MySQL is not the bottleneck — it's waiting on everything else (queue delivery, H2 lock contention, batch accumulation time). To go faster, you'd look at increasing `NUM_CONSUMERS`, tuning `basicQos`, or reducing H2 lock contention — not MySQL.
+
+If MySQL throughput ≈ end-to-end rate, MySQL is the ceiling and tuning batch size or connection pool would help.
+
+### --benchmark and --benchmark-full
+
+The benchmark flags were split to match this distinction:
+
+| Flag | Phases | MySQL test | Safe in production? |
+|---|---|---|---|
+| `--benchmark` | 1, 2, 4 | No | Yes |
+| `--benchmark-full` | 1, 2, 3, 4 | Yes — truncates table | No |
+| *(no flag, just file path)* | 1, 2, 4 (auto) | No | Yes |
+
+`--benchmark-full` is now rarely needed. The live metrics collected during a normal pipeline run give you the same MySQL insight without destroying data.
+
+---
+
+## 50. Producer Time — Measuring the Publishing Step
+
+The pipeline has two distinct phases that run partly in parallel:
+1. **Producer** — reads the CSV line by line and publishes to RabbitMQ
+2. **Consumers** — read from RabbitMQ, generate IDs, insert to MySQL
+
+Without measuring them separately, a "12 minute total" tells you nothing about where time was spent. To isolate the producer:
+
+```java
+long producerStart = System.currentTimeMillis();
+producerThread.start();
+producerThread.join();
+long producerMs = System.currentTimeMillis() - producerStart;
+```
+
+`producerMs` = time from first publish to last publish. `totalMs - producerMs` = **consumer lag** — how long after the producer finished before the last row was committed to MySQL. This is the most direct indicator of which side is the bottleneck:
+
+| Pattern | Meaning |
+|---|---|
+| Produce: 42s, Lag: 678s | Consumers are the bottleneck — queue backed up massively |
+| Produce: 600s, Lag: 60s | Producer is the bottleneck — consumers kept up easily |
+| Produce ≈ Lag | Balanced — both sides are matched |
+
+For the 720s run: 42s publish, 678s lag. The producer finished in under a minute. Consumers spent 11 more minutes draining the queue. MySQL insert throughput was the pacing factor.
+
+---
+
 ## 44. Summary of Changes — This Session
 
 The table below is a condensed record of what changed, why, and what you would look for in the code.
@@ -4103,6 +4474,29 @@ The table below is a condensed record of what changed, why, and what you would l
 | `splitCsv()` replaces `split(",")` | `FileConsumer.java` | Quoted fields containing commas shifted all column indices | `splitCsv(line)` in `parseLine()` |
 | Shovel plugin for DLQ replay | RabbitMQ container | Move failed messages back to main queue after fixing the bug | `docker exec <container> rabbitmq-plugins enable rabbitmq_shovel rabbitmq_shovel_management` |
 | **V2 — H2 in-memory registry** | | | |
+| H2 instance isolation fix — unique DB name per instance | `InMemoryIdRegistry.java` | `DB_CLOSE_DELAY=-1` kept `used_ids` table alive between instances; benchmark created two sequential instances and crashed on the second | `"jdbc:h2:mem:id_registry_" + System.nanoTime()` instead of a fixed name |
+| **Clean shutdown + final summary** | | | |
+| `volatile` on observer counters | `FileConsumer.java` | Main thread reads counters after executor shutdown — visibility across threads required | `private volatile long totalProcessed` |
+| `shutdown()` method on `FileConsumer` | `FileConsumer.java` | Pipeline was hanging indefinitely after queue drained; last in-flight flushes needed to complete before stats were collected | `scheduler.shutdown(); flushExecutor.shutdown(); awaitTermination(...)` |
+| Consumer list in `Main.java` | `Main.java` | Needed a reference to each consumer after pipeline ends to call `shutdown()` and aggregate stats | `List<FileConsumer> consumers = new ArrayList<>()` |
+| Pipeline complete summary log | `Main.java` | No visible signal that the pipeline had finished; process would hang | `log.info("PIPELINE COMPLETE")` block with duration, inserted, dupes, errors, avg rate |
+| Natural JVM exit after shutdown | `Main.java` | Once executors are drained they are no longer non-daemon — JVM exits without `System.exit()` | Follows from `consumer.shutdown()` completing |
+| **Fee splitting** | | | |
+| V5 migration — `network_fee` + `itc_fee` columns | `V5__add_fee_columns.sql` | Store the split of fees into network share and ITC share on the row itself | `ADD COLUMN network_fee DECIMAL(18,6) NULL, ADD COLUMN itc_fee DECIMAL(18,6) NULL` |
+| `FeeCalculator` service | `FeeCalculator.java` (new) | Business rule: inflow fees split by source_id rate; outflows are NULL | `rateFor(sourceId)` switch + `calculate(Transaction t)` |
+| `networkFee` + `itcFee` fields on `Transaction` | `Transaction.java` | Model reflects new columns | Two `BigDecimal` fields added |
+| `TransactionRepository` — two new params | `TransactionRepository.java` | INSERT must include the new columns; params 20–21; total params 26 | `stmt.setBigDecimal(20, t.getNetworkFee())` |
+| `feeCalculator.calculate(t)` in consumer callback | `FileConsumer.java` | Called after `parseLine()`, before batch accumulation | One line after `setGeneratedId()` |
+| **Pipeline observability + clean exit** | | | |
+| `System.exit(0)` after summary | `Main.java` | RabbitMQ client library creates non-daemon threads that kept the JVM alive after the pipeline finished | After the summary log block |
+| Producer time tracked separately | `Main.java` | Single "duration" number hid whether producer or consumers were the bottleneck | `long producerMs = System.currentTimeMillis() - pipelineStart` captured at `producerThread.join()` |
+| Consumer lag in summary | `Main.java` | `totalMs - producerMs` = time queue took to drain after producer finished — direct bottleneck signal | `log.info("Consumer lag: {}s", consumerMs / 1000)` |
+| `totalIdGenNs` counter | `FileConsumer.java` | Track how long ID generation + H2 registration takes per row | `System.nanoTime()` around `generateUniqueId()`; displayed as µs/id in summary |
+| `totalDbMs` + `totalBatches` counters | `FileConsumer.java` | Collect live MySQL insert metrics during real pipeline run — replaces destructive Phase 3 synthetic benchmark | Accumulated in `flushBatch()` from existing `dbMs` value |
+| MySQL throughput in summary | `Main.java` | `totalInserted / (totalDbMs / 1000.0)` = pure MySQL insert rate excluding all other overhead | Lets you compare MySQL ceiling vs end-to-end rate to find bottleneck |
+| `--benchmark` → safe phases only | `Main.java` | Previously `--benchmark` ran all 4 phases including truncation; now safe to run anywhere | Calls `runAutomatic()` instead of `run()` |
+| `--benchmark-full` flag added | `Main.java` | Explicit opt-in for the destructive MySQL truncation test | Calls `run()` (all 4 phases) |
+| "Benchmarks done — starting pipeline…" moved to `Main.java` | `Main.java` / `Benchmark.java` | `runAutomatic()` was printing "starting pipeline" even when called from `--benchmark` (no pipeline follows) | Removed from `Benchmark.runAutomatic()`; printed by `Main` before the pipeline starts |
 | V4 migration — drop `ux_generated_id` from MySQL | `V4__drop_generated_id_index.sql` | MySQL no longer enforces uniqueness; H2 is the sole guard | `ALTER TABLE transactions DROP INDEX ux_generated_id` |
 | H2 dependency | `build.gradle.kts` | New dep for in-memory DB | `implementation("com.h2database:h2:2.2.224")` |
 | `InMemoryIdRegistry` service | `InMemoryIdRegistry.java` (new) | Replaces `ConcurrentHashMap` / `HashSet` — SQL uniqueness via H2 | `CREATE TABLE used_ids (id BIGINT PRIMARY KEY)` + `register(long id)` |

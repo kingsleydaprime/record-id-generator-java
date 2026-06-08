@@ -26,6 +26,8 @@ public class Transaction {
     private String currency;
     private BigDecimal amount;
     private BigDecimal fees;
+    private BigDecimal networkFee;
+    private BigDecimal itcFee;
     private int year;
     private String processor;
     private String country;

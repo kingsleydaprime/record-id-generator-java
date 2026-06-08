@@ -87,7 +87,8 @@ public class Benchmark {
      */
     public void runAutomatic() throws Exception {
         header("AUTO-BENCHMARK — baseline measurements before pipeline starts");
-        System.out.println("  Tip: run with --benchmark to also include MySQL insert throughput.");
+        System.out.println("  Tip: run with --benchmark-full to also benchmark MySQL insert throughput.");
+        System.out.println("  WARNING: --benchmark-full truncates the transactions table.");
         System.out.println();
 
         header("PHASE 1 — MICRO-BENCHMARKS  (no services required)");
@@ -105,12 +106,6 @@ public class Benchmark {
         projections(genNs, parseNs, hashSetNs, h2Ns);
         separator();
         pipelineSummary();
-
-        System.out.println();
-        System.out.println("=".repeat(74));
-        System.out.println("  Benchmarks done — starting pipeline...");
-        System.out.println("=".repeat(74));
-        System.out.println();
     }
 
     // -------------------------------------------------------------------------
